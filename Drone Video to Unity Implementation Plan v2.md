@@ -505,3 +505,263 @@ json.dump({"video_fps": VIDEO_FPS, "tracks": list(by_id.values())},
 (Dilated boxes are the default masks. For tighter cutouts run a seg model and paint polygons — but only load it if you actually use it; optionally refine with **SAM2** — Phase 10. If people still detect poorly at `imgsz=1920`, switch detection to tiled inference — **SAHI**, Appendix D.)
 
 ---
+
+## Phase 3 — Establish the geometry (the heart of the conversion)
+
+Choose your regime from Part 1.1. **For pre-recorded footage, Phase 3B is your default.**
+
+### 3A — Static camera (single homography)
+
+Only if the camera is locked off. Compute one `H` from 4 known points (see Phase 3B-step-1 / calibrate.py) and skip registration. Every frame uses the same `H`.
+
+### 3B — Moving camera + flat ground (per-frame homography) — **the workhorse**
+
+**Step 1 — Calibrate the reference frame to world meters** (once):
+
+```python
+# calibrate.py -> out/H_ref_to_world.npy  +  out/calibration.json (the binding)
+import cv2, hashlib, json, numpy as np, glob, os
+
+frames = sorted(glob.glob("frames/*.jpg"))
+REF = len(frames) // 2                     # pick one showing most of the area; FROZEN by the binding below
+ref_path = frames[REF]
+
+# get 4+ (u,v) by clicking on ref_path; assign their real (X,Z) in METERS, in Unity axes
+image_pts = np.array([[ux1,vy1],[ux2,vy2],[ux3,vy3],[ux4,vy4]], np.float32)
+world_pts = np.array([[X1, Z1],[X2, Z2],[X3, Z3],[X4, Z4]], np.float32)   # meters
+H_ref_to_world, _ = cv2.findHomography(image_pts, world_pts)
+np.save("out/H_ref_to_world.npy", H_ref_to_world)
+
+# BIND the clicks to this exact frame: clicked pixels are meaningless on any other frame,
+# and 'ref_frame: auto' re-picking a different reference would silently invalidate them.
+json.dump({"ref_index": REF,
+           "ref_frame_file": os.path.basename(ref_path),
+           "ref_frame_sha1": hashlib.sha1(open(ref_path, "rb").read()).hexdigest(),
+           "points": np.hstack([image_pts, world_pts]).tolist()},
+          open("out/calibration.json", "w"), indent=2)
+```
+
+*(Tip: a 10-line `cv2.setMouseCallback` click tool beats reading pixel coords by eye.)*
+
+**Step 2 — Register every frame to the reference** and compose to world:
+
+```python
+# geometry.py -> out/H_per_frame.npy (H_{t→W} per extracted frame) + out/inliers.npy
+import cv2, glob, json, numpy as np
+
+STRIDE      = 6      # must match Phase 1.4 — the config is the single source of truth (Part 2.8)
+MIN_MATCHES = 12
+MIN_INLIERS = 15
+REANCHOR_K  = 25     # try a direct-to-reference match every K extracted frames
+
+frames   = sorted(glob.glob("frames/*.jpg"))
+N        = len(frames)
+mask_for = lambda i: f"masks/frame_{i*STRIDE:06d}.png"   # extracted frame i ↔ video frame i·STRIDE
+REF      = json.load(open("out/calibration.json"))["ref_index"]   # the binding decides, not 'auto'
+H_rw     = np.load("out/H_ref_to_world.npy")
+
+orb = cv2.ORB_create(5000)
+bf  = cv2.BFMatcher(cv2.NORM_HAMMING)
+CACHE = {}                                     # keypoints per frame (pop old entries if RAM-tight)
+def feats(i):
+    if i not in CACHE:
+        g = cv2.cvtColor(cv2.imread(frames[i]), cv2.COLOR_BGR2GRAY)
+        m = cv2.imread(mask_for(i), 0)
+        keep = cv2.bitwise_not(m) if m is not None else None   # exclude white (= movers/overlays)
+        CACHE[i] = orb.detectAndCompute(g, keep)
+    return CACHE[i]
+
+def register(i, j):
+    """ORB+RANSAC homography frame i → frame j. Returns (H, inliers) or (None, 0)."""
+    (kpA, desA), (kpB, desB) = feats(i), feats(j)
+    if desA is None or desB is None: return None, 0
+    good = [m for m, nn in bf.knnMatch(desA, desB, k=2) if m.distance < 0.75 * nn.distance]
+    if len(good) < MIN_MATCHES: return None, 0
+    src = np.float32([kpA[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([kpB[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H, inl = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    return (H, int(inl.sum())) if H is not None else (None, 0)
+
+H_to_ref = [None] * N; inliers = [0] * N
+H_to_ref[REF] = np.eye(3); inliers[REF] = 10**6
+
+# chain OUTWARD from REF in both directions — consecutive frames always overlap
+for step in (+1, -1):
+    i = REF + step
+    while 0 <= i < N:
+        H_step, inl = register(i, i - step)                  # frame i → its already-registered neighbor
+        if H_step is not None and H_to_ref[i - step] is not None:
+            H_to_ref[i] = H_to_ref[i - step] @ H_step        # H_{i→R} = H_{i-1→R} · H_{i→i-1}
+            inliers[i]  = min(inl, inliers[i - step])        # a chain is only as good as its weakest link
+        # re-anchor: kill accumulated drift periodically, AND whenever the chain broke
+        if H_to_ref[i] is None or abs(i - REF) % REANCHOR_K == 0:
+            H_dir, inl_dir = register(i, REF)
+            if H_dir is not None and inl_dir >= MIN_INLIERS:
+                H_to_ref[i], inliers[i] = H_dir, inl_dir
+        i += step
+
+# frames that stayed None: INTERPOLATE between nearest registered neighbors — never reuse a stale H
+norm = lambda H: H / H[2, 2]
+reg  = [i for i in range(N) if H_to_ref[i] is not None]
+for i in range(N):
+    if H_to_ref[i] is None:
+        lo = max([r for r in reg if r < i], default=None)
+        hi = min([r for r in reg if r > i], default=None)
+        if lo is None:   H_to_ref[i] = H_to_ref[hi]
+        elif hi is None: H_to_ref[i] = H_to_ref[lo]
+        else:
+            a = (i - lo) / (hi - lo)
+            H_to_ref[i] = (1 - a) * norm(H_to_ref[lo]) + a * norm(H_to_ref[hi])
+
+np.save("out/H_per_frame.npy", np.array([H_rw @ H for H in H_to_ref]))   # compose: pixel_t -> world meters
+np.save("out/inliers.npy", np.array(inliers))                            # the Phase 8 gate reads this
+```
+
+> **What changed vs. the naive version.** (1) **Chaining, not direct-to-reference:** consecutive extracted frames always overlap, so the chain never starves; direct matching to one reference fails as soon as an orbit/sweep changes the view too much. (2) **Failures are marked, never held:** a frame that can't register stays `None` and is later *interpolated* between registered neighbors — copying the previous `H` would silently freeze the geometry while the camera keeps moving, then snap. (3) **Re-anchoring bounds drift:** every `REANCHOR_K` frames (and whenever the chain breaks) a direct match to the reference is attempted and, if it lands with enough inliers, replaces the chained estimate. For very long sweeps where the reference never returns into view, register against the *growing mosaic* instead. (4) `inliers.npy` is the per-frame quality record — the Phase 8 gate consumes it, and Phase 9 uses it to locate bad stretches.
+
+### 3C — Moving camera + real 3D (pose + depth) — upgrade
+
+Only if off-ground structures or terrain relief matter. Run COLMAP (or VGGT) for poses+intrinsics, run Depth Anything V2 / Video Depth Anything for depth, then back-project foot points (Part 2.3-C). Output the same `tracks_world.json` shape so Phases 6–7 are unchanged. (Details in Phase 10.)
+
+---
+
+## Phase 4 — Build the static ground (rectified frame or mosaic)
+
+**Goal:** one top-down ground image in the **world frame** to texture the Unity plane, aligned to the agent coordinates.
+
+### 4A — Single rectified frame (quick; fine for small areas / near-nadir)
+
+Warp your reference frame into the world frame:
+
+```python
+import cv2, glob, json, numpy as np
+H_rw = np.load("out/H_ref_to_world.npy")
+REF  = json.load(open("out/calibration.json"))["ref_index"]      # the binding decides — never hardcode a filename
+ref  = cv2.imread(sorted(glob.glob("frames/*.jpg"))[REF])
+PPM  = 20                                  # pixels per meter in the texture
+x0, z0, W_m, H_m = 0.0, 0.0, 60.0, 40.0    # quick path: known rectangle; Phase 4B auto-computes this instead
+S = np.float32([[PPM, 0, -PPM*x0], [0, PPM, -PPM*z0], [0, 0, 1]])   # meters -> texture pixels
+ground = cv2.warpPerspective(ref, S @ H_rw, (int(W_m*PPM), int(H_m*PPM)))
+cv2.imwrite("out/ground.png", cv2.flip(ground, 0))   # flip ONCE: OpenCV top-left origin → Unity bottom-left UV
+```
+
+### 4B — Median mosaic (recommended for moving cameras; removes movers)
+
+Warp **every masked frame** into the world frame and take the per-pixel **median** → a clean, larger ground plate with people/cars erased:
+
+```python
+# build_mosaic.py -> out/ground.png + out/world_bounds.json
+import cv2, glob, json, numpy as np
+
+STRIDE, PPM = 6, 20
+H_world  = np.load("out/H_per_frame.npy")
+frames   = sorted(glob.glob("frames/*.jpg"))
+mask_for = lambda i: f"masks/frame_{i*STRIDE:06d}.png"   # same convention as geometry.py (Part 2.8)
+
+# 1) world bounds: warp every frame's corners — never guess the footprint a priori
+h, w = cv2.imread(frames[0]).shape[:2]
+corners = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
+pts = np.vstack([cv2.perspectiveTransform(corners, Hw)[:, 0] for Hw in H_world])
+x0, z0 = pts.min(0) - 5.0                                # 5 m margin
+x1, z1 = pts.max(0) + 5.0
+W_m, H_m = float(x1 - x0), float(z1 - z0)
+Wp, Hp = int(W_m * PPM), int(H_m * PPM)
+S = np.float32([[PPM, 0, -PPM*x0], [0, PPM, -PPM*z0], [0, 0, 1]])   # meters -> texture px, origin (x0,z0)
+
+# 2) masked median: validity is a SEPARATE boolean — 0 is a real pixel value, not a sentinel
+#    (in-band zero-as-NaN eats legit black pixels PER CHANNEL: shadows/asphalt get color-skewed)
+warps, valids = [], []
+for i, (fp, Hw) in enumerate(zip(frames, H_world)):
+    img  = cv2.imread(fp)
+    mpix = cv2.imread(mask_for(i), 0)                    # white = mover (already dilated in Phase 2)
+    warps.append(cv2.warpPerspective(img, S @ Hw, (Wp, Hp)))
+    vld  = cv2.warpPerspective(255 - mpix, S @ Hw, (Wp, Hp), flags=cv2.INTER_NEAREST)
+    valids.append(vld > 200)                             # NEAREST + strict: no half-valid border pixels
+imgs  = np.stack(warps)                                  # (N,Hp,Wp,3) uint8 — 4x smaller than float32
+valid = np.stack(valids)                                 # (N,Hp,Wp)  bool
+m = np.ma.array(imgs, mask=~np.repeat(valid[..., None], 3, axis=3))
+ground = np.ma.median(m, axis=0).filled(0).astype(np.uint8)
+
+cv2.imwrite("out/ground.png", cv2.flip(ground, 0))       # flip ONCE: OpenCV top-left → Unity bottom-left UV
+json.dump({"x0": float(x0), "z0": float(z0), "W_m": W_m, "H_m": H_m, "ppm": PPM},
+          open("out/world_bounds.json", "w"), indent=2)
+```
+
+> **Memory:** the stack is `N × Hp × Wp × 3` bytes (uint8). Auto-computed bounds can get big on long sweeps — if it exceeds RAM, process the canvas in **tiles** (exact median, bounded memory): loop over `TILE×TILE` regions, warp only that ROI from each frame (shift `S` by the tile offset), median it, write it into `ground`. Peak memory becomes `N × TILE² × 3` (≈ 220 MB for 350 frames at `TILE=512`) regardless of canvas size. Subsampling frames (every 2nd–3rd) is a *speed* knob on top, not the memory fix — and note a true streaming "running median" does not exist; don't chase one. The median is what makes moving objects vanish.
+
+---
+
+## Phase 5 — Map image tracks → world tracks (+ smoothing & gaps)
+
+**Goal:** convert image-space foot points into world meters using the geometry, then clean the trajectories.
+
+```python
+# map_to_world.py -> out/tracks_world.json
+import cv2, json, numpy as np
+
+STRIDE   = 6                                   # must match Phase 1.4 (config is the single source of truth)
+data     = json.load(open("out/tracks_image.json"))
+H_stack  = np.load("out/H_per_frame.npy")      # Regime B; for A use a single H for all frames
+SMOOTH_K, MAX_GAP_S, STITCH = 5, 0.5, True
+MAX_SPEED = {"person": 3.0, "vehicle": 15.0}   # m/s gate for stitching
+
+def H_at(n):
+    """Homography for VIDEO frame n — INTERPOLATED between registration samples.
+    Nearest-neighbor lookup gives every detection in a stride-window the same H,
+    then jumps: tracks stair-step, and no smoothing window can hide it."""
+    f  = n / STRIDE
+    i0 = min(int(f), len(H_stack) - 1)
+    i1 = min(i0 + 1, len(H_stack) - 1)
+    a  = f - i0
+    H0, H1 = H_stack[i0] / H_stack[i0][2, 2], H_stack[i1] / H_stack[i1][2, 2]
+    return (1 - a) * H0 + a * H1               # adjacent H's are close → normalized lerp is accurate
+
+def smooth(seq, k=SMOOTH_K):                   # simple moving average to kill jitter
+    if len(seq) < k: return seq
+    out, half = [], k // 2
+    for i in range(len(seq)):
+        lo, hi = max(0, i - half), min(len(seq), i + half + 1)
+        out.append(sum(seq[lo:hi]) / (hi - lo))
+    return out
+
+def split_on_gaps(pts, max_dt=MAX_GAP_S):      # smoothing must NOT blend across occlusion gaps
+    segs, cur = [], [pts[0]]
+    for p in pts[1:]:
+        if p["t"] - cur[-1]["t"] <= max_dt: cur.append(p)
+        else: segs.append(cur); cur = [p]
+    segs.append(cur); return segs
+
+# 1) image -> world through interpolated H; split on gaps; smooth per segment
+segments = []                                  # (class, [{t,x,z}...])
+for tr in data["tracks"]:
+    world = []
+    for p in tr["pts"]:
+        XZ = cv2.perspectiveTransform(np.float32([[[p["u"], p["v"]]]]), H_at(p["n"]))[0][0]
+        world.append({"t": p["t"], "x": float(XZ[0]), "z": float(XZ[1])})
+    for seg in split_on_gaps(world):
+        xs, zs = smooth([q["x"] for q in seg]), smooth([q["z"] for q in seg])
+        segments.append((tr["class"], [{"t": q["t"], "x": x, "z": z}
+                                       for q, x, z in zip(seg, xs, zs)]))
+
+# 2) stitch: rejoin segments (same class) whose gap passes the max-speed gate in METERS
+if STITCH:
+    segments.sort(key=lambda s: s[1][0]["t"])
+    stitched = []
+    for cls, seg in segments:
+        prev = next((s for s in reversed(stitched) if s[0] == cls
+                     and 0 < seg[0]["t"] - s[1][-1]["t"] <= 3.0
+                     and np.hypot(seg[0]["x"] - s[1][-1]["x"], seg[0]["z"] - s[1][-1]["z"])
+                         <= MAX_SPEED[cls] * (seg[0]["t"] - s[1][-1]["t"])), None)
+        prev[1].extend(seg) if prev else stitched.append((cls, seg))
+    segments = stitched
+
+tracks = [{"id": i, "class": cls, "pts": seg} for i, (cls, seg) in enumerate(segments)]
+json.dump({"video_fps": data["video_fps"], "tracks": tracks},
+          open("out/tracks_world.json", "w"), indent=2)
+```
+
+**Gaps & broken tracks:** when a person is occluded, the tracker may give them a **new ID** afterward, splitting one path into two. The code above handles both halves of the problem: `split_on_gaps` stops the smoother from inventing motion across occlusions (an index-based average would smear a 2 s disappearance into a fake glide), and the stitcher rejoins segments whose gap passes a **max-speed gate** in world meters — a person can't cover 10 m in 0.3 s. Segments that can't be stitched stay as separate short tracks; fine for schematic.
+
+**Output:** `out/tracks_world.json` — `{video_fps, tracks:[{id, class, pts:[{t,x,z}]}]}` in meters, Unity axes. IDs are re-issued after split/stitch.
+
+---
