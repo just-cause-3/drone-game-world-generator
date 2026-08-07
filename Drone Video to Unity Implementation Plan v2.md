@@ -383,3 +383,125 @@ project/
 ```
 
 ---
+
+## Phase 0 — Validate the Unity side first (fake data, ~1 hour)
+
+Prove the Unity half before touching CV, so the halves never block each other.
+
+1. New Unity URP project. Add a **Plane** (default 10×10 units).
+2. Make a **Capsule** prefab (`Person`) and a car-sized **Cube** prefab (`Vehicle`).
+3. Hardcode 2–3 fake tracks (lists of `(t, x, z)`) and move the prefabs along them with a tiny script (replaced by the real loader in Phase 6).
+4. Add a top-down camera; press Play.
+
+**Success:** a capsule and a box glide along set paths on the plane.
+
+---
+
+## Phase 1 — Ingest & pre-process the pre-recorded video
+
+**Goal:** one clean, continuous, constant-fps clip → frames, with overlays removed.
+
+### 1.1 Inspect the file
+
+```bash
+# true (possibly fractional) frame rate, resolution, duration
+ffprobe -v 0 -of csv=p=0 -select_streams v:0 \
+  -show_entries stream=r_frame_rate,width,height,duration drone.mp4
+```
+
+### 1.2 Split edited clips into single continuous shots
+
+Pre-recorded clips often contain cuts. Detect/split first:
+
+```bash
+# auto-detect scene cuts and split into separate files
+scenedetect -i drone.mp4 detect-adaptive split-video
+# or manually trim one continuous shot:
+ffmpeg -ss 00:00:12 -to 00:01:10 -i drone.mp4 -c copy shot.mp4
+```
+
+Process **one continuous shot at a time** — registration and tracking both break across cuts.
+
+### 1.3 Normalize fps & crop overlays/HUD
+
+```bash
+# force constant 30 fps and crop a burned-in HUD (crop=W:H:X:Y), if any
+ffmpeg -i shot.mp4 -filter:v "crop=in_w:in_h-80:0:0,fps=30" -qscale:v 2 shot_clean.mp4
+```
+
+### 1.3b Handle lens distortion (do not skip for wide-FOV cameras)
+
+A homography is exact only for a **pinhole** camera. Wide-FOV drone/action-cam lenses have real barrel distortion: RANSAC keeps the (nearly pinhole) frame center and silently discards edge matches, so registration *reports success* while edge detections land meters off and mosaic borders curve. Pick one, cheapest first:
+
+1. **Border crop (default, nearly free):** distortion is worst at the edges — crop 10–15 % off every border and move on. Extend the Phase 1.3 filter, e.g. `crop=in_w*0.8:in_h*0.8`.
+2. **One-parameter undistortion (better):** estimate a single division-model coefficient `k1` from the footage itself — undistort a handful of frame pairs with candidate `k1` values (`cv2.undistort` with `K ≈ [[w,0,w/2],[0,w,h/2],[0,0,1]]`, `D = [k1,0,0,0]`), and keep the `k1` that maximizes the RANSAC inlier fraction. If straight lines (road edges, lot markings) are visible, "which `k1` makes them straight" is an equivalent, quicker criterion.
+
+Whichever you choose, apply it **before** Phases 2 and 3 — detection, registration, and the calibration clicks must all see the *same* pixels.
+
+### 1.4 Extract registration frames (integer stride — Part 2.8)
+
+Do **not** extract with `fps=4`: a second frame rate creates a second timeline, and every downstream pairing (frame↔mask, detection↔homography) silently misaligns. Take **every Nth video frame** instead:
+
+```bash
+mkdir frames
+# STRIDE=6: 30 fps video → 5 fps registration frames. Raise to save compute, lower for fast motion.
+ffmpeg -i shot_clean.mp4 -vf "select='not(mod(n\,6))'" -fps_mode vfr -qscale:v 2 frames/frame_%06d.jpg
+# (older ffmpeg: use -vsync vfr instead of -fps_mode vfr)
+```
+
+> **The mapping is exact by construction:** extracted file numbered `i` (1-based `frame_%06d`) is video frame `n = (i−1)·STRIDE`; its mask is `masks/frame_{n:06d}.png` (Phase 2); its timestamp is `n / VIDEO_FPS`. Detection still runs on the video directly at full fps. High overlap between consecutive extracted frames is what makes chained registration (Phase 3B) reliable — prefer a smaller stride when the camera moves fast.
+
+---
+
+## Phase 2 — Detect & track people/vehicles (+ masks)
+
+**Goal:** (a) image-space tracks (foot points over time) for the dynamic layer; (b) per-frame **masks** of movers + overlays for clean registration/mosaic.
+
+```python
+# track_agents.py -> out/tracks_image.json  AND  masks/*.png
+from ultralytics import YOLO
+import cv2, json, os, numpy as np
+
+VIDEO_FPS  = 30.0                   # the MEASURED fps (ffprobe, Phase 1.1) — comes from config, never guessed
+FOOT_SHIFT = {"person": 0.02, "vehicle": 0.18}   # fraction of bbox height; oblique-view bias fix (see note below)
+CLASS_MAP  = {0:"person", 1:"vehicle", 2:"vehicle", 3:"vehicle", 5:"vehicle", 7:"vehicle"}
+DILATE     = np.ones((25, 25), np.uint8)         # swallow the moving-shadow fringe around each box
+os.makedirs("masks", exist_ok=True)
+
+model = YOLO("yolo11m.pt")          # yolo11l if the GPU allows; small objects need pixels more than params
+by_id, n = {}, 0                    # n = VIDEO frame number — the one index everything is keyed by (Part 2.8)
+
+for res in model.track("video/shot_clean.mp4", persist=True, stream=True, verbose=False,
+                       imgsz=1920, device=0, tracker="botsort.yaml"):
+    # imgsz=1920: people are ~10–25 px from altitude; the default 640 destroys them
+    # botsort.yaml: BoT-SORT with global motion compensation — required for a MOVING camera
+    img = res.orig_img
+    h, w = img.shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+    if res.boxes is not None and res.boxes.id is not None:
+        for box, cid, tid in zip(res.boxes.xyxy.cpu().numpy(),
+                                 res.boxes.cls.cpu().numpy(),
+                                 res.boxes.id.cpu().numpy()):
+            cid = int(cid)
+            if cid not in CLASS_MAP:    # ignore classes we don't care about
+                continue
+            x1, y1, x2, y2 = box
+            cls = CLASS_MAP[cid]
+            u = (x1 + x2) / 2.0
+            v = y2 - FOOT_SHIFT[cls] * (y2 - y1)   # FOOT POINT, shifted off the near edge (see note below)
+            d = by_id.setdefault(int(tid), {"id": int(tid), "class": cls, "pts": []})
+            d["pts"].append({"n": n, "t": round(n / VIDEO_FPS, 3), "u": float(u), "v": float(v)})
+            cv2.rectangle(mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, -1)
+    mask = cv2.dilate(mask, DILATE)                 # tight boxes leave moving shadows unmasked
+    cv2.imwrite(f"masks/frame_{n:06d}.png", mask)   # named by VIDEO frame number; white = EXCLUDE
+    n += 1
+
+json.dump({"video_fps": VIDEO_FPS, "tracks": list(by_id.values())},
+          open("out/tracks_image.json", "w"), indent=2)
+```
+
+**Why the foot-point shift:** at oblique angles the bbox bottom-center is the object's *near ground edge*, not its footprint center. During an orbit that offset rotates with the camera, so a **parked** car appears to trace a small circle even with perfect geometry. `FOOT_SHIFT` cancels most of it — calibrate the two constants once per clip angle by picking a visibly parked car and minimizing its world-track spread (Phase 9). For near-nadir clips set both ≈ half the footprint.
+
+(Dilated boxes are the default masks. For tighter cutouts run a seg model and paint polygons — but only load it if you actually use it; optionally refine with **SAM2** — Phase 10. If people still detect poorly at `imgsz=1920`, switch detection to tiled inference — **SAHI**, Appendix D.)
+
+---
