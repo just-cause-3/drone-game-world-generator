@@ -765,3 +765,473 @@ json.dump({"video_fps": data["video_fps"], "tracks": tracks},
 **Output:** `out/tracks_world.json` — `{video_fps, tracks:[{id, class, pts:[{t,x,z}]}]}` in meters, Unity axes. IDs are re-issued after split/stitch.
 
 ---
+
+## Phase 6 — Spawn & animate the agents in Unity
+
+1. Copy `out/ground.png` and `out/tracks_world.json` into `UnityProject/Assets/Generated/`.
+2. Ground: a **Plane** scaled to `(W_m/10, 1, H_m/10)`, material Base Map = `ground.png`, centered at `(x0 + W_m/2, 0, z0 + H_m/2)` with **rotation identity** — `x0, z0, W_m, H_m` come from `scene_meta.json` (the auto-computed bounds, Phase 4B). The mosaic was already vertically flipped in Phase 4 to match Unity's bottom-left UV origin; verify once with the Phase 9 probe scene.
+3. Agents: `Person` (capsule) + `Vehicle` (cube) prefabs, animated by:
+
+```csharp
+// AgentPlayback.cs — animate prefabs along world-space tracks
+using System.Collections.Generic;
+using UnityEngine;
+
+[System.Serializable] public class Pt    { public float t, x, z; }
+[System.Serializable] public class Track { public int id; public string @class; public List<Pt> pts; }
+[System.Serializable] public class Data  { public float video_fps; public List<Track> tracks; }
+
+public class AgentPlayback : MonoBehaviour
+{
+    public TextAsset tracksJson;                 // Assets/Generated/tracks_world.json
+    public GameObject personPrefab, vehiclePrefab;
+    public float groundY = 0f, timeScale = 1f;
+
+    readonly List<(Track tr, Transform go)> agents = new();
+    // video-seconds — the ONE clock. The zone logger reads this, NOT Time.time:
+    // wall-clock stamps desync from the footage the moment timeScale != 1.
+    public static float SimTime { get; private set; }
+
+    void Start()
+    {
+        var data = JsonUtility.FromJson<Data>(tracksJson.text);
+        foreach (var tr in data.tracks)
+        {
+            var go = Instantiate(tr.@class == "person" ? personPrefab : vehiclePrefab).transform;
+            go.name = $"{tr.@class}_{tr.id}";
+            go.gameObject.SetActive(false);
+            agents.Add((tr, go));
+        }
+    }
+
+    void Update()
+    {
+        SimTime += Time.deltaTime * timeScale;
+        float clock = SimTime;
+        foreach (var (tr, go) in agents)
+        {
+            var p = tr.pts;
+            if (clock < p[0].t || clock > p[p.Count - 1].t) { go.gameObject.SetActive(false); continue; }
+            go.gameObject.SetActive(true);
+            int i = 0; while (i < p.Count - 1 && p[i + 1].t < clock) i++;
+            var a = p[i]; var b = p[Mathf.Min(i + 1, p.Count - 1)];
+            float u = Mathf.Approximately(b.t, a.t) ? 0f : (clock - a.t) / (b.t - a.t);
+            Vector3 pos = new Vector3(Mathf.Lerp(a.x, b.x, u), groundY, Mathf.Lerp(a.z, b.z, u));
+            Vector3 dir = pos - go.position;
+            if (dir.sqrMagnitude > 1e-5f) go.rotation = Quaternion.LookRotation(dir.normalized);
+            go.position = pos;
+        }
+    }
+}
+```
+
+**Pivot/scale tips:** offset each prefab so its base sits at `y = 0` (so it stands *on* the plane). Size the capsule to ~1.8 m, the vehicle cube to ~4.5 × 1.5 × 2 m, so the scene reads correctly.
+
+**Success:** people and vehicles move across your flat map following their real trajectories — a Unity recreation driven entirely by the pre-recorded footage.
+
+---
+
+## Phase 7 — Zone System + logging (the surveillance layer)
+
+Identical in spirit to v1; this is where the source document's ideas pay off.
+
+```csharp
+// ZoneVolume.cs
+using UnityEngine;
+public enum ZoneType { EntryGate, Barracks, Perimeter, Unknown }
+[RequireComponent(typeof(BoxCollider))]
+public class ZoneVolume : MonoBehaviour {
+    public ZoneType zoneType = ZoneType.Perimeter;
+    public string zoneId = "Z0"; public int priority = 0;   // higher wins on overlap
+    void Reset() => GetComponent<BoxCollider>().isTrigger = true;
+}
+```
+```csharp
+// DetectionLogger.cs — timestamps are VIDEO-seconds (AgentPlayback.SimTime), passed in by the caller
+using System.IO; using UnityEngine;
+public class DetectionLogger : MonoBehaviour {
+    public static DetectionLogger I; StreamWriter w;
+    void Awake() {
+        I = this;
+        w = new StreamWriter(Path.Combine(Application.persistentDataPath, "detections.csv")){AutoFlush=true};
+        w.WriteLine("sim_time,object_type,zone_type,zone_id,x,y,z");
+    }
+    public void Log(float simTime, string type, ZoneType zt, string zid, Vector3 p) =>
+        w.WriteLine($"{simTime:F2},{type},{zt},{zid},{p.x:F2},{p.y:F2},{p.z:F2}");
+    void OnApplicationQuit() => w?.Dispose();
+}
+```
+```csharp
+// AgentZoneReporter.cs — on each agent prefab (needs a Collider + kinematic Rigidbody).
+// Zone membership is LATCHED with Enter/Exit — the old Stay-then-clear-in-LateUpdate pattern
+// races the physics step (render fps > physics fps => rows silently dropped).
+using System.Collections.Generic; using UnityEngine;
+public class AgentZoneReporter : MonoBehaviour {
+    public string objectType = "person";
+    public float logInterval = 0.5f;                     // sim-seconds between rows (bounds CSV size)
+    readonly HashSet<ZoneVolume> inside = new();
+    float nextLog;
+
+    void OnTriggerEnter(Collider o){ var z = o.GetComponent<ZoneVolume>(); if (z) inside.Add(z); }
+    void OnTriggerExit (Collider o){ var z = o.GetComponent<ZoneVolume>(); if (z) inside.Remove(z); }
+
+    void Update() {
+        if (inside.Count == 0 || AgentPlayback.SimTime < nextLog) return;
+        nextLog = AgentPlayback.SimTime + logInterval;
+        ZoneVolume best = null;
+        foreach (var z in inside) if (best == null || z.priority >= best.priority) best = z;
+        DetectionLogger.I?.Log(AgentPlayback.SimTime, objectType, best.zoneType, best.zoneId, transform.position);
+    }
+}
+```
+
+Place a few trigger boxes (gate/barracks/perimeter) over the map, set priorities, and you get a timestamped CSV of who was in which zone — the surveillance replay log. Timestamps are **video-seconds** (`AgentPlayback.SimTime`), so the CSV lines up with the footage at any `timeScale`; `logInterval` bounds the file size (the old per-render-frame logging produced hundreds of rows per second per agent). Agents still need a Collider + kinematic Rigidbody for triggers to fire, and `SetActive(false)` on despawn correctly fires `OnTriggerExit`.
+
+---
+
+## Phase 8 — Automate the pipeline (one command)
+
+```
+run.py shot.mp4 :
+  1) ingest.py        ffprobe + (split/crop/fps) + ffmpeg frames
+  2) track_agents.py  -> out/tracks_image.json, masks/*.png
+  3) calibrate.py     -> out/H_ref_to_world.npy   (interactive once; cache it)
+  4) geometry.py      -> out/H_per_frame.npy
+  5) build_mosaic.py  -> out/ground.png
+  6) map_to_world.py  -> out/tracks_world.json
+  7) copy ground.png + tracks_world.json -> UnityProject/Assets/Generated/
+```
+
+Chain with `subprocess.run(..., check=True)`; fail on first error. Optionally end with a headless Unity run (`Unity -batchmode -quit -projectPath <p> -executeMethod BuildRunner.Build`) to auto-build the scene and produce the CSV.
+
+### 8.1 Can it be fully "video in → Unity world out"? (the honest verdict)
+
+**Yes, ~90% of it can run hands-off from a single command.** Frame extraction, detection + tracking, per-frame registration, the mosaic, mapping to world coordinates, and the Unity scene assembly all run unattended. **Two things qualify "fully":** one step resists full automation (**calibration** — real-world scale & orientation), and one reality means you shouldn't blindly emit output (**quality depends on the clip**, so the pipeline must *gate*, not just run).
+
+### 8.2 What's automatic vs. the one manual step
+
+| Stage | Auto? |
+|---|---|
+| Ingest / split cuts / crop HUD / fps / frames | ✅ (heuristics; per-clip config sometimes) |
+| Detect + track (YOLO) + masks | ✅ |
+| Per-frame registration (chained ORB+RANSAC + re-anchoring) | ✅ (inlier gating; failed frames interpolated, never held stale) |
+| Median mosaic / ground texture | ✅ |
+| Map image tracks → world tracks + smoothing | ✅ |
+| Unity scene assembly (batch mode) | ✅ (build script + Unity installed) |
+| **Calibration (4 known-world points)** | ⚠️ **the human-in-the-loop step** |
+
+**Three ways to remove the calibration step:**
+- **(a) Unscaled, auto-oriented world** — skip metric calibration entirely; define the world frame automatically from the reference frame's pixel plane scaled by a guessed pixels-per-meter. Agents still move correctly *relative* to each other and the ground; it's just not real-scale. Usually fine for "not detailed." Fully automatic.
+- **(b) Auto-estimate scale** — from telemetry if the clip carries altitude/focal data (ground sampling distance), or from a heuristic such as median detected **car length ≈ 4.5 m** (bootstrap the unknown scale factor from object sizes in the reference frame).
+- **(c) Satellite geo-registration** — feature-match the mosaic against satellite imagery to recover real scale + orientation + geo-coordinates. Most automatic *and* real-scale, but advanced.
+
+### 8.3 Don't output garbage: robustness gates
+
+"*Any* video → a *good* world" is **not** guaranteed (output depends on the clip — Part 1). A robust pipeline gates and reports "unsuitable clip" instead of emitting a broken scene. Cheap automated checks:
+- registration **inlier counts** per frame (too few → unreliable),
+- **motion/blur** estimate (Laplacian variance; large frame-to-frame jumps),
+- **detection counts** (subjects too small/absent),
+- **featureless-ground** detection (too few ORB features → water/tarmac/snow).
+
+Surface a short report ("82% frames registered; 9 tracks; scale = unscaled") so a human can trust or reject the result.
+
+### 8.4 Architecture & the two output flavors
+
+**Two kinds of "world out the other end," both achievable:**
+- **A — a Unity project/scene you open:** the pipeline drops `ground.png` + `tracks_world.json` into `Assets/Generated/` and a build script assembles the scene (plane + agents + zones) in batch mode.
+- **B — a built, runnable app (desktop / WebGL):** the truest "video in → world out," produced by a **headless Unity build** (`-batchmode -quit -executeMethod`). Note: Unity needs a **license even in batch mode**; the standard way to containerize this on a server is **GameCI** Docker images.
+
+**Shape of the system:**
+- **Now:** a **CLI tool** — `run.py video.mp4` → emits the assets / scene / build.
+- **Later (the "upload here, download there" experience):** wrap it as **upload → job queue → worker (Python pipeline + Unity batch build) → download link**. Standard plumbing (a small web front end + a background worker).
+
+**Advice:** get **one clip working manually end-to-end first**, then automate. Automating before the manual flow works means debugging the factory and the product simultaneously — the classic trap. Build phases 1→7 by hand once; *then* write `run.py` and the batch build.
+
+---
+
+### 8.5 The automatable 90%, built out
+
+Everything below is the concrete implementation of the automatic stages. The **only** non-automatic input is calibration (the 4 known-world points), and even that has an auto-fallback (8.7) — with one honest limit: the fallback gives a *correct* (just unscaled) world **only when the reference frame is roughly top-down**; for an oblique reference view you genuinely need the 4-point calibration (or satellite geo-registration) to get the shape right, not merely the scale.
+
+#### Stage contract (the execution DAG + file artifacts)
+
+```
+ input video
+    │  ingest()         → frames/*.jpg (stride subset)  + MEASURED video_fps
+    ├─ track()          → out/tracks_image.json, masks/frame_{n}.png  (per video frame)
+    ├─ calibrate()      → out/H_ref_to_world.npy + out/calibration.json  (frame-bound points, OR auto-fallback)
+    ├─ geometry()       → out/H_per_frame.npy + out/inliers.npy     (chained + re-anchored)
+    ├─ mosaic()         → out/ground.png + out/world_bounds.json    (auto bounds; UV-flipped)
+    ├─ map_world()      → out/tracks_world.json                     (interpolated H; split + stitch)
+    ├─ gate()           → out/report.json          (PASS/FAIL + metrics)   ← stops here if FAIL
+    ├─ deploy()         → UnityProject/Assets/Generated/{ground.png, tracks_world.json, scene_meta.json}
+    └─ unity_build()    → Recreation.unity  (and optionally a player build)
+```
+
+Each producer is independent except for the obvious data dependencies; `gate()` is the safety valve that prevents emitting a broken world.
+
+#### 8.6 `config.yaml` — one place to drive a run
+
+```yaml
+input: video/shot.mp4
+work_dir: out
+unity_project: UnityProject
+
+ingest:
+  split_on_cuts: true          # PySceneDetect; process the longest segment
+  crop: null                   # e.g. "in_w:in_h-80:0:0" to remove a HUD, or null
+  border_crop_pct: 10          # lens-distortion mitigation (Phase 1.3b); 0 to disable
+  stride: 6                    # registration frames = every Nth VIDEO frame (Part 2.8)
+  # video_fps is MEASURED by ffprobe at run time — an OUTPUT of ingest, never an input
+
+detect:
+  model: yolo11m.pt            # yolo11l if the GPU allows; small objects need pixels more than params
+  imgsz: 1920                  # inference size — the default 640 destroys 10–25 px people
+  device: 0                    # CUDA GPU index ('cpu' / 'mps' also valid)
+  dynamic_classes: [0,1,2,3,5,7]   # COCO ids: person + vehicles
+  mask_dilate_px: 25           # swallow the moving-shadow fringe
+  foot_shift: {person: 0.02, vehicle: 0.18}   # oblique-view foot-point correction (Phase 2)
+
+geometry:
+  ref_frame: auto              # IGNORED once out/calibration.json exists — the binding wins (8.7)
+  min_matches: 12
+  min_inliers: 15              # below this a frame counts as unregistered (→ interpolated)
+  reanchor_every: 25           # extracted frames between direct-to-reference re-anchor attempts
+
+calibrate:                     # the only manual bit — leave 'points' null to auto-fallback
+  points: null                 # [[u,v,X,Z] x 4] clicked on the ref frame; binding → out/calibration.json
+  auto: car_size               # used only if points==null: 'car_size' | 'unscaled'
+  ppm: 20                      # pixels-per-meter for the ground texture
+  # world bounds are AUTO-COMPUTED from the registered footage (Phase 4B) — nothing to guess
+
+map:
+  smooth_window: 5
+  max_gap_s: 0.5               # split tracks on time gaps larger than this BEFORE smoothing
+  stitch_gaps: true            # rejoin segments that pass the max-speed gate (implemented in Phase 5)
+
+gates:
+  min_frames_registered_pct: 60
+  min_tracks: 1
+  max_blur_pct: 40             # % of frames allowed below blur_threshold
+  blur_threshold: 100.0        # Laplacian variance; below = blurry
+
+unity:
+  build_player: false          # true = also produce a runnable app
+  build_target: StandaloneWindows64   # the CUDA box; StandaloneOSX / StandaloneLinux64 as needed
+```
+
+#### 8.7 `run.py` — the full orchestrator
+
+```python
+#!/usr/bin/env python3
+"""run.py <config.yaml> — one command: video in → Unity-ready world out.
+Heavy CV stages reuse the Phase 1–5 scripts' logic (import them as functions or
+call as subprocesses); the glue, auto-calibration, gating, and deployment are here."""
+import sys, os, json, glob, shutil, subprocess, hashlib
+import numpy as np, cv2, yaml
+
+# --- import the per-phase logic (refactor Phase 1–5 scripts into importable functions) ---
+from scripts.ingest        import ingest_video           # -> frames/, returns (clip, video_fps, stride)
+from scripts.track_agents  import run_tracking           # -> tracks_image.json, masks/frame_{n}.png
+from scripts.geometry      import register_all, pick_reference   # -> H_per_frame, inliers
+from scripts.build_mosaic  import build_median_mosaic    # -> ground.png; returns + writes world bounds
+from scripts.map_to_world  import map_tracks             # -> tracks_world.json
+
+def sha1(path): return hashlib.sha1(open(path, "rb").read()).hexdigest()
+
+def resolve_reference(cfg, frames):
+    """The calibration binding OVERRIDES ref_frame:auto — clicked pixels only mean anything
+    on the exact frame they were clicked on (auto re-picking silently invalidates them)."""
+    if os.path.exists("out/calibration.json"):
+        b = json.load(open("out/calibration.json"))
+        ref_path = f"frames/{b['ref_frame_file']}"
+        if not os.path.exists(ref_path):
+            sys.exit("FATAL: calibration is bound to a frame that no longer exists — recalibrate.")
+        if sha1(ref_path) != b["ref_frame_sha1"]:
+            sys.exit("FATAL: reference frame content changed (crop/stride/re-encode) — recalibrate.")
+        return frames.index(ref_path), b
+    return pick_reference(frames, cfg["geometry"]["ref_frame"]), None
+
+def estimate_ppm_from_cars(ref_path, default):
+    """Scale from car sizes — orientation-filtered so end-on cars can't poison the median
+    (an end-on car contributes its ~1.8 m WIDTH as 'length' → scale off by up to 2.5x)."""
+    from ultralytics import YOLO
+    boxes = YOLO("yolo11m.pt")(ref_path, imgsz=1920, verbose=False)[0].boxes
+    dims  = [(float(x2 - x1), float(y2 - y1)) for x1, y1, x2, y2, conf, c in boxes.data.tolist()
+             if int(c) == 2]                                          # COCO 2 = car
+    lengths = [max(a, b) for a, b in dims if max(a, b) / max(1.0, min(a, b)) > 1.6]  # reject end-on
+    if len(lengths) < 5:
+        return default, "unscaled"                                    # too few samples: don't pretend
+    spread = np.percentile(lengths, 75) / max(1.0, np.percentile(lengths, 25))
+    ppm    = float(np.median(lengths)) / 4.5
+    return ppm, ("auto_scaled" if spread < 1.4 else "auto_scaled_lowconf")  # wide spread = oblique/mixed
+
+def calibrate(cfg, binding, ref_path, img_h):
+    """The only step that can need a human. Returns H_ref_to_world (pixels->meters) + scale status."""
+    if binding:                                        # manual points, bound to this exact frame
+        pts = np.array(binding["points"], np.float32)
+        H, _ = cv2.findHomography(pts[:, :2], pts[:, 2:])
+        return H, "metric"
+    c = cfg["calibrate"]
+    ppm, status = (estimate_ppm_from_cars(ref_path, c["ppm"]) if c["auto"] == "car_size"
+                   else (c["ppm"], "unscaled"))
+    # v-down pixels mapped straight to +Z would build a MIRRORED world: negate v, shift so Z >= 0
+    H = np.float32([[1/ppm, 0, 0], [0, -1/ppm, img_h/ppm], [0, 0, 1]])
+    return H, status
+
+def blur_pct(frames, thresh):
+    v = [cv2.Laplacian(cv2.imread(f, 0), cv2.CV_64F).var() for f in frames]
+    return 100.0 * float(np.mean(np.array(v) < thresh))
+
+def gate(cfg, inliers, n_tracks, blur):
+    g = cfg["gates"]
+    reg_pct = 100.0 * float(np.mean(np.array(inliers) >= cfg["geometry"]["min_inliers"]))
+    ok = (reg_pct >= g["min_frames_registered_pct"] and n_tracks >= g["min_tracks"]
+          and blur <= g["max_blur_pct"])
+    return ok, {"frames_registered_pct": round(reg_pct, 1), "tracks": n_tracks,
+                "blur_pct": round(blur, 1), "pass": bool(ok)}
+
+def main(cfg_path):
+    cfg = yaml.safe_load(open(cfg_path))
+    wd  = cfg["work_dir"]; os.makedirs(wd, exist_ok=True)
+
+    # 1) ingest — returns the MEASURED fps; no stage below declares its own frame rate
+    clip, video_fps, stride = ingest_video(cfg["input"], cfg["ingest"])
+
+    # 2) detect + track on the full-fps video (masks named by video frame number) ---
+    n_tracks = run_tracking(clip, cfg["detect"], video_fps,
+                            out=f"{wd}/tracks_image.json", masks="masks")
+
+    # 3) geometry: bound reference + chained per-frame registration ------------
+    frames = sorted(glob.glob("frames/*.jpg"))
+    ref_idx, binding = resolve_reference(cfg, frames)
+    img_h = cv2.imread(frames[ref_idx]).shape[0]
+    H_rw, scale_status = calibrate(cfg, binding, frames[ref_idx], img_h)
+    np.save(f"{wd}/H_ref_to_world.npy", H_rw)
+    H_world, inliers = register_all(frames, stride, ref_idx, H_rw, cfg["geometry"])
+    np.save(f"{wd}/H_per_frame.npy", H_world); np.save(f"{wd}/inliers.npy", inliers)
+
+    # 4) GATE — stop before producing anything if the clip is unsuitable -------
+    ok, report = gate(cfg, inliers, n_tracks, blur_pct(frames, cfg["gates"]["blur_threshold"]))
+    report["scale_status"] = scale_status
+    json.dump(report, open(f"{wd}/report.json", "w"), indent=2)
+    print("REPORT:", report)
+    if not ok:
+        print("FAIL: clip unsuitable — not deploying. See report.json."); sys.exit(2)
+
+    # 5) ground texture (auto bounds, UV-flipped) + world tracks ---------------
+    bounds = build_median_mosaic(frames, stride, H_world, cfg["calibrate"]["ppm"],
+                                 out=f"{wd}/ground.png")   # also writes out/world_bounds.json
+    map_tracks(f"{wd}/tracks_image.json", H_world, stride, cfg["map"],
+               out=f"{wd}/tracks_world.json")
+
+    # 6) deploy artifacts into the Unity project -------------------------------
+    gen = f"{cfg['unity_project']}/Assets/Generated"; os.makedirs(gen, exist_ok=True)
+    shutil.copy(f"{wd}/ground.png", gen); shutil.copy(f"{wd}/tracks_world.json", gen)
+    json.dump({**bounds, "scale_status": scale_status},   # bounds = {x0, z0, W_m, H_m, ppm}
+              open(f"{gen}/scene_meta.json", "w"))
+
+    # 7) optional headless Unity build (assemble scene; optionally build a player)
+    unity = os.environ.get("UNITY_BIN", "Unity")
+    subprocess.run([unity, "-batchmode", "-quit", "-projectPath", cfg["unity_project"],
+                    "-executeMethod", "BuildRunner.Build",
+                    "-buildPlayer", str(cfg["unity"]["build_player"]).lower(),
+                    "-buildTarget", cfg["unity"]["build_target"]], check=True)
+    print("DONE → open Assets/Generated/Recreation.unity"
+          + ("  (+ player build in Build/)" if cfg["unity"]["build_player"] else ""))
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "config.yaml")
+```
+
+> To make this runnable, refactor the Phase 1–5 snippets into the imported functions (`ingest_video`, `run_tracking`, `pick_reference`, `register_all`, `build_median_mosaic`, `map_tracks`) — the same code, wrapped in `def`s that take paths/config and return their outputs. Note the contracts: `ingest_video` returns the **measured** fps + the stride; `register_all` returns homographies **and** the inlier array; `build_median_mosaic` returns the auto-computed bounds dict it also writes to `world_bounds.json`. No function declares its own frame rate (Part 2.8).
+
+#### 8.8 `BuildRunner.cs` — Unity batch scene assembly (the headless build step)
+
+```csharp
+// Assets/Editor/BuildRunner.cs — invoked by: Unity -batchmode -quit -executeMethod BuildRunner.Build
+using System.IO;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class BuildRunner
+{
+    const string GEN = "Assets/Generated";
+
+    [System.Serializable] class Meta { public float x0, z0, W_m, H_m, ppm; public string scale_status; }
+
+    public static void Build()
+    {
+        // read CLI args
+        bool buildPlayer = HasFlag("-buildPlayer", "true");
+        var meta = JsonUtility.FromJson<Meta>(File.ReadAllText($"{GEN}/scene_meta.json"));
+
+        // fresh scene
+        var scene = EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
+
+        // ground plane (Unity Plane = 10x10 units) sized to the world rectangle
+        AssetDatabase.ImportAsset($"{GEN}/ground.png");
+        var ground = GameObject.CreatePrimitive(PrimitiveType.Plane);
+        ground.name = "Ground";
+        ground.transform.localScale = new Vector3(meta.W_m / 10f, 1f, meta.H_m / 10f);
+        ground.transform.position   = new Vector3(meta.x0 + meta.W_m / 2f, 0f, meta.z0 + meta.H_m / 2f); // auto bounds
+        ground.transform.rotation   = Quaternion.identity;   // plane +X/+Z = world +X/+Z, stated explicitly
+        var mat = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+        mat.SetTexture("_BaseMap", AssetDatabase.LoadAssetAtPath<Texture2D>($"{GEN}/ground.png"));
+        ground.GetComponent<MeshRenderer>().sharedMaterial = mat;
+
+        // agent playback driver
+        var driver = new GameObject("AgentPlayback").AddComponent<AgentPlayback>();
+        driver.tracksJson    = AssetDatabase.LoadAssetAtPath<TextAsset>($"{GEN}/tracks_world.json");
+        driver.personPrefab  = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Person.prefab");
+        driver.vehiclePrefab = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Vehicle.prefab");
+
+        // logger + (optional) zone boxes could be instantiated here from a zones config
+        new GameObject("DetectionLogger").AddComponent<DetectionLogger>();
+
+        // top-down camera
+        var cam = new GameObject("TopCam").AddComponent<Camera>();
+        cam.transform.position = new Vector3(meta.x0 + meta.W_m / 2f, Mathf.Max(meta.W_m, meta.H_m), meta.z0 + meta.H_m / 2f);
+        cam.transform.eulerAngles = new Vector3(90, 0, 0);
+
+        Directory.CreateDirectory(GEN);
+        EditorSceneManager.SaveScene(scene, $"{GEN}/Recreation.unity");
+
+        if (buildPlayer)
+        {
+            var target = ParseTarget();
+            string outPath = target == BuildTarget.WebGL ? "Build/web" : "Build/app.exe";
+            BuildPipeline.BuildPlayer(new[] { $"{GEN}/Recreation.unity" }, outPath, target, BuildOptions.None);
+        }
+    }
+
+    static bool HasFlag(string flag, string val)
+    {
+        var a = System.Environment.GetCommandLineArgs();
+        for (int i = 0; i < a.Length - 1; i++) if (a[i] == flag && a[i + 1] == val) return true;
+        return false;
+    }
+    static BuildTarget ParseTarget()
+    {
+        var a = System.Environment.GetCommandLineArgs();
+        for (int i = 0; i < a.Length - 1; i++)
+            if (a[i] == "-buildTarget" && System.Enum.TryParse(a[i + 1], out BuildTarget t)) return t;
+        return BuildTarget.StandaloneWindows64;
+    }
+}
+```
+
+This assembles the whole scene from the three generated files (`ground.png`, `tracks_world.json`, `scene_meta.json`) with **no clicks**. It assumes your `Person`/`Vehicle` prefabs exist at `Assets/Prefabs/` (made once in Phase 0/6) and the scripts from Phases 6–7 are in the project. Running on a server needs a Unity **license even in batch mode** — use **GameCI** Docker images to containerize it (8.4).
+
+#### 8.9 The run report (what "automated judgment" produces)
+
+```json
+{ "frames_registered_pct": 84.2, "tracks": 17, "blur_pct": 6.1, "scale_status": "auto_scaled", "pass": true }
+```
+
+`run.py` writes this every run and **refuses to deploy** when `pass` is false (too few registered frames, no tracks, etc.). That's what turns "automated *steps*" into "automated *judgment*" — the pipeline either hands you a trustworthy world or tells you the clip wasn't good enough, instead of silently emitting garbage.
+
+**Net result:** `python run.py config.yaml` → frames, detections, geometry, a clean ground texture, world-space tracks, a quality report, and an assembled `Recreation.unity` (optionally a runnable build) — the full automatable 90%, with calibration as the single optional human input.
+
+---
