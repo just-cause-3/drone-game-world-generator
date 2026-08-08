@@ -1235,3 +1235,124 @@ This assembles the whole scene from the three generated files (`ground.png`, `tr
 **Net result:** `python run.py config.yaml` → frames, detections, geometry, a clean ground texture, world-space tracks, a quality report, and an assembled `Recreation.unity` (optionally a runnable build) — the full automatable 90%, with calibration as the single optional human input.
 
 ---
+
+## Phase 9 — Validate & measure accuracy
+
+- **Probe scene (do this FIRST — separates the two mirror bugs):** map two recognizable ground landmarks from the reference frame through `H_ref_to_world`, drop two colored spheres at those `(X, groundY, Z)` in Unity, and check they sit on the correct spots *of the rendered texture*. Spheres mirrored relative to the texture → the Phase 4 flip is missing or doubled. Spheres consistent with the texture but the whole world mirrored vs. reality → Appendix B, case 1 (negate a calibration axis).
+- **Reprojection check (geometry):** take a known ground landmark, map it through `H_{t→W}` in several frames; the world position should be stable across frames. Big variation = bad registration in those frames (cross-check `out/inliers.npy`).
+- **Overlay check (visual):** in Unity, screenshot the top-down view and overlay a video frame — the ground texture and a few static features should line up.
+- **Scale check:** measure a known object in Unity; it should match reality.
+- **Track sanity:** play it back; agents should move smoothly and stay on plausible paths. Regular stair-steps → the `H` lookup isn't interpolating (Phase 5's `H_at`); random jitter → increase smoothing; jumps → registration gaps (check `inliers.npy`). Parked vehicles tracing small circles → tune `FOOT_SHIFT` (Phase 2).
+- **Iterate the *clip choice* first:** most quality comes from picking a steadier, more top-down, flatter clip (Part 1) before tuning code.
+
+---
+
+## Phase 10 — Optional upgrades
+
+- **Regime C (pose + depth)** for off-ground/relief scenes: COLMAP or VGGT poses + Depth Anything V2 / Video Depth Anything, back-project foot points (Part 2.3-C). Same `tracks_world.json` output → Unity unchanged.
+- **SAM2 masks** for precise mover cutouts (cleaner mosaic; better registration).
+- **Better mosaic** via OpenCV stitching / multiband blending for large sweeps.
+- **One-Euro / Kalman smoothing** for nicer agent motion than a moving average.
+- **In-Unity live detection** (opposite direction; optional): Unity **Inference Engine** (`com.unity.ai.inference`, formerly Sentis — Barracuda is deprecated) + YOLO ONNX.
+- **Georeferencing:** if you ever get a clip *with* telemetry, you can place the world in real map coordinates.
+
+---
+
+## Worked example (end-to-end)
+
+**Clip:** 70 s pre-recorded shot, drone slowly **orbiting** a parking lot from ~60 m, camera ~40° down. Regime **B**.
+
+1. **Phase 1:** `ffprobe` → 29.97 fps; one continuous shot (no cuts); a small bottom HUD → crop it; 10 % border crop for lens distortion (1.3b); normalize to 30 fps; extract every 6th frame (stride 6 ≙ 5 fps) → ~350 registration frames, mapped to video frame numbers by construction.
+2. **Phase 2:** YOLO11m at `imgsz=1920` on the GPU (BoT-SORT + GMC) tracks the people + cars → `tracks_image.json` (points carry `n` + foot-shift); dilated box masks named by video frame number → `masks/`.
+3. **Phase 3B:** pick a mid-orbit reference (most lot visible); click 4 lot corners, assign `(0,0),(50,0),(50,30),(0,30)` meters → `H_ref_to_world` + `calibration.json` (the clicks are **bound** to that exact frame); chained ORB+RANSAC registration outward from the reference, re-anchoring every 25 frames → `H_per_frame` + `inliers.npy`.
+4. **Phase 4B:** masked median mosaic over auto-computed bounds → clean lot image with all moving cars erased, vertically flipped for Unity → `ground.png` + `world_bounds.json`.
+5. **Phase 5:** map foot points through time-**interpolated** `H`, split on occlusion gaps, smooth per segment, stitch → `tracks_world.json`.
+6. **Phase 6:** Unity plane scaled to `(5, 1, 3)` (50×30 m), textured with the mosaic; capsules/cubes animate along the tracks.
+7. **Phase 7:** drop an `EntryGate` box at the lot entrance, a `Perimeter` box around the edge → `detections.csv` logs cars entering the gate, people crossing the perimeter.
+
+**Result:** a flat, correctly-scaled parking-lot map in Unity with the real cars and pedestrians replaying their paths, and a zone log — built without any 3D reconstruction.
+
+---
+
+## Appendix A — Troubleshooting (expanded)
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Whole scene slowly slides over time | Used a single homography on a moving camera (Regime A on B footage) | Switch to per-frame registration (Phase 3B) |
+| Agents drift / positions wrong on some frames | Registration failed (few inliers) on those frames | Lower the stride (more overlap); dilate masks; check `out/inliers.npy` for long interpolated stretches; re-anchor more often (smaller `reanchor_every`) |
+| Ground mosaic has ghost cars/people | Movers not masked before median | Ensure `masks/` exclude movers; rely on the temporal **median**, not mean |
+| Mosaic has seams / blur | Pure overwrite blending / drift | Use median; multiband blending; shorter segment; re-anchor registration |
+| Off-ground objects placed wrong (rooftops, etc.) | Flat-ground assumption (Regime B) | Accept (ground agents only) or upgrade to Regime C |
+| Whole map mirrored **vs. reality** (texture + agents together) | World axes don't match Unity's | Negate one axis in the 4 calibration world points (Appendix B, case 1) |
+| Agents mirrored **vs. the ground texture** | Missing/doubled texture flip (OpenCV top-left vs Unity bottom-left UV) | Exactly one `cv2.flip(ground, 0)` in Phase 4; verify with the Phase 9 probe scene (Appendix B, case 2) |
+| Wrong overall scale | No telemetry; approximate calibration; end-on cars poisoned the auto-scale | Calibrate from a known object size or a satellite-map measurement; check `scale_status` for `auto_scaled_lowconf` |
+| Mosaic edges curved / frame borders misaligned | Lens distortion (homography assumes a pinhole camera) | Border-crop or estimate `k1` undistortion (Phase 1.3b) |
+| CSV timestamps don't match video times | Logging Unity wall clock instead of the playback clock | Log `AgentPlayback.SimTime` (Phase 7); it's timeScale-proof |
+| Few/no detections | Subjects too small / blurry / model too small | Higher-res or lower-altitude clip; larger YOLO (m/l) |
+| One person becomes several IDs | Occlusion breaks the track; camera motion confuses the tracker | Phase 5's stitcher rejoins them (max-speed gate); ensure BoT-SORT GMC is on; raise `imgsz` |
+| Agents move in regular stair-steps | `H` looked up nearest-neighbor instead of interpolated over time | Use Phase 5's `H_at()`; don't try to smooth this away |
+| Agents jitter (random) | Raw track noise | Increase smoothing window; One-Euro/Kalman (Phase 10) |
+| Parked vehicles trace small circles during an orbit | Foot point = bbox near edge at oblique angles | Tune `FOOT_SHIFT` (Phase 2) on a visibly parked car |
+| Registration totally fails | Featureless ground (water/tarmac/snow), fast motion, or hidden cut in the clip | Pick a textured/flat/steady clip; split on cuts (Phase 1.2) |
+| Trigger logging never fires | Missing kinematic Rigidbody / zone not `isTrigger` | Agent needs Collider + kinematic Rigidbody; zone box `isTrigger = true` |
+| Agents float / sink | Wrong `groundY` or prefab pivot | Set `groundY` to plane Y; offset pivot so base is at y=0 |
+| VFR weirdness / time mismatch | Variable frame rate, or a stage declaring its own frame rate | Normalize fps (Phase 1.3); `video_fps` is measured by ffprobe and `stride` lives only in the config (Part 2.8) |
+
+---
+
+## Appendix B — Coordinate-system cheat sheet
+
+| Frame | Dims | Axes | Units | Used in |
+|---|---|---|---|---|
+| Image / pixel | 2D | u→right, v→**down**, origin top-left | pixels | detections, feature matching |
+| World / ground | 2D | X→right/east, Z→forward/north | **meters** | the fixed reference; homography output |
+| Unity world | 3D | X→right, Y→**up**, Z→forward (**left-handed**) | meters (1 unit) | scene placement |
+| Camera (Regime C) | 3D | camera-centered | depends | back-projection |
+
+- **Define world (X,Z) in Unity's convention** so no conversion is needed downstream.
+- Agent at world `(X,Z)` → Unity `(X, groundY, Z)`.
+- **Mirror fix — two distinct bugs, two distinct fixes (don't conflate them):**
+  1. *Whole world mirrored vs. reality* (texture **and** agents flipped together): negate one axis in the 4 calibration `world_pts` (e.g., `Z → -Z`) and re-run; re-verify on a known landmark.
+  2. *Agents mirrored vs. the ground texture* (relative mismatch): calibration **cannot** fix this — both layers derive from the same `H`, so flipping calibration flips them together. Cause: OpenCV images are top-left origin / v-down, Unity UVs are bottom-left / v-up. Fix: exactly one `cv2.flip(ground, 0)` when writing the texture (Phase 4). Verify with the Phase 9 probe scene.
+- **Homography composition is right-to-left:** `H_{t→W} = H_{R→W} · H_{t→R}` (apply `H_{t→R}` to the pixel first).
+
+---
+
+## Appendix C — Glossary
+
+- **Schematic recreation:** rebuilding a scene as a flat map + simple moving markers, not real 3D geometry.
+- **Homography:** a 3×3 projective transform mapping one flat plane to another (image pixels ↔ ground meters, or frame ↔ frame). Exact only for a flat plane.
+- **Registration:** computing the transform that aligns one image to another (here, each frame to a reference) via feature matching.
+- **Feature matching / ORB / SIFT / RANSAC:** finding corresponding points between images and robustly fitting a transform that ignores outliers.
+- **Mosaic / orthomosaic:** many frames warped into one coordinate frame and blended into a single large top-down image.
+- **Temporal median (background estimation):** taking the median pixel over time so moving objects (present only briefly) disappear, leaving the static background.
+- **Foot point:** bottom-center of a detection box — where the object meets the ground; the point the homography maps correctly.
+- **Camera pose / extrinsics (R, t):** the camera's 3D orientation and position; needed for the Regime-C back-projection.
+- **Intrinsics (K):** focal length & principal point; map camera-3D ↔ pixels.
+- **Back-projection:** turning a pixel + its depth into a 3D point.
+- **Drift:** accumulated error when chaining many frame-to-frame transforms.
+- **Track:** one object's path across frames under a single ID.
+- **NMS:** removes duplicate overlapping detection boxes (inside YOLO).
+
+---
+
+## Appendix D — Tools & references
+
+- Unity (Hub + 6 LTS, URP) — unity.com
+- ffmpeg / ffprobe — ffmpeg.org
+- PySceneDetect (split edited clips) — scenedetect.com
+- Ultralytics YOLO (v11 / v12; detect, track, segment) — docs.ultralytics.com
+- SAHI (tiled inference for small objects from altitude) — github.com/obss/sahi
+- OpenCV (`findHomography`, `perspectiveTransform`, `warpPerspective`, ORB/SIFT, RANSAC, stitching) — opencv.org
+- SAM 2 (optional fine masks) — github.com/facebookresearch/sam2
+- Depth Anything V2 / Video Depth Anything (Regime C depth) — github.com/DepthAnything
+- COLMAP (Regime C poses) — colmap.github.io ; VGGT (feed-forward poses+geometry) — github.com/facebookresearch/vggt
+- Unity Inference Engine (optional in-engine detection; formerly Sentis) — docs.unity3d.com/Packages/com.unity.ai.inference@latest
+
+---
+
+### Where to start (do this in order)
+
+**Phase 0** (fake data on a plane) → **Phase 1** (clean one continuous shot) → **Phase 2** (track agents) → **Phase 3B** (calibrate + per-frame registration) → **Phase 4B** (median mosaic) → **Phase 5** (map + smooth) → **Phase 6** (agents on the map) → **Phase 7** (zones + log). Pick a **steady, near-top-down, flat-area** clip first — it's the easiest input and makes the per-frame-homography path reliable.
+
+> This v3 supersedes v2: same architecture, hardened implementation — one frame-index convention (Part 2.8), chained + re-anchored registration, time-interpolated homographies, frame-bound calibration, lens-distortion handling, masked-median mosaic with auto-computed bounds, and a time-correct zone logger. The companion *"Issues and Fixes"* doc records why each change exists.
