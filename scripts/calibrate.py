@@ -97,3 +97,88 @@ def calibrate_H(cfg, binding, ref_path):
     # v-down pixels mapped straight to +Z would build a MIRRORED world: negate v, shift so Z >= 0
     H = np.float32([[1 / ppm, 0, 0], [0, -1 / ppm, img_h / ppm], [0, 0, 1]])
     return H, status
+
+
+# ---------------------------------------------------------------- interactive click tool
+def _click_tool(cfg):
+    frames = sorted(glob.glob(p(cfg, "frames", "frame_*.jpg")))
+    if not frames:
+        die("no frames/ yet - run the pipeline once first (python run.py)")
+    wd = p(cfg, cfg["work_dir"])
+
+    # prefer the reference the pipeline already used (report.json), else re-pick
+    ref_idx = None
+    rpath = os.path.join(wd, "report.json")
+    if os.path.exists(rpath):
+        ref_idx = json.load(open(rpath, encoding="utf-8")).get("ref_index")
+    if ref_idx is None:
+        ref_idx = pick_reference(frames, "auto")
+    ref_path = frames[ref_idx]
+    img = cv2.imread(ref_path)
+    h, w = img.shape[:2]
+    scale = min(1.0, 1600.0 / w)
+    disp_base = cv2.resize(img, (int(w * scale), int(h * scale)))
+
+    image_pts, world_pts = [], []
+    clicked = []
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked.append((x / scale, y / scale))
+
+    win = "calibrate - click ground points (s=save, u=undo, ESC=abort)"
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win, on_mouse)
+    print("Click 4+ recognizable GROUND points; after each click type its real-world")
+    print("X Z in meters (Unity axes: X=right/east, Z=forward/north), e.g.:  0 0")
+
+    while True:
+        disp = disp_base.copy()
+        for k, (u, v) in enumerate(image_pts):
+            c = (int(u * scale), int(v * scale))
+            cv2.circle(disp, c, 6, (0, 0, 255), -1)
+            cv2.putText(disp, f"{k}:({world_pts[k][0]:g},{world_pts[k][1]:g})",
+                        (c[0] + 8, c[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow(win, disp)
+        key = cv2.waitKey(30) & 0xFF
+
+        if clicked:
+            u, v = clicked.pop(0)
+            try:
+                raw = input(f"point {len(image_pts)} at pixel ({u:.0f},{v:.0f}) -> world X Z [m]: ")
+                X, Z = map(float, raw.split())
+            except (ValueError, EOFError):
+                print("  bad input, point discarded")
+                continue
+            image_pts.append((u, v)); world_pts.append((X, Z))
+
+        if key == ord("u") and image_pts:
+            image_pts.pop(); world_pts.pop()
+        elif key == ord("s"):
+            if len(image_pts) < 4:
+                print(f"  need at least 4 points, have {len(image_pts)}")
+                continue
+            break
+        elif key == 27:
+            cv2.destroyAllWindows()
+            die("aborted - nothing saved")
+
+    cv2.destroyAllWindows()
+    ipts = np.array(image_pts, np.float32)
+    wpts = np.array(world_pts, np.float32)
+    H, _ = cv2.findHomography(ipts, wpts)
+    if H is None:
+        die("points are degenerate (collinear?) - nothing saved")
+    os.makedirs(wd, exist_ok=True)
+    np.save(os.path.join(wd, "H_ref_to_world.npy"), H)
+    with open(os.path.join(wd, "calibration.json"), "w", encoding="utf-8") as f:
+        json.dump({"ref_index": ref_idx,
+                   "ref_frame_file": Path(ref_path).name,
+                   "ref_frame_sha1": _sha1(ref_path),
+                   "points": np.hstack([ipts, wpts]).tolist()}, f, indent=2)
+    log("calib", f"saved {len(image_pts)} points bound to {Path(ref_path).name}")
+    log("calib", "re-run the pipeline (python run.py) - tracking is reused, geometry recomputes")
+
+
+if __name__ == "__main__":
+    _click_tool(load_config(sys.argv[1] if len(sys.argv) > 1 else "config.yaml"))
