@@ -197,3 +197,132 @@ math with synthetic data — if it passes, the environment and the core logic ar
 Setup is done. You never repeat section 3 (except `activate` each new terminal).
 
 ---
+
+## 4. Choosing and adding your video
+
+### 4.1 What footage works
+
+Best → worst, based on how the geometry behaves:
+
+1. **High-altitude, near top-down, slow orbit/pan over flat ground** (parking lot,
+   yard, intersection) — ideal.
+2. **Hovering overhead shot** — ideal and even simpler.
+3. **Moderate oblique (~30-50 degrees down), slow motion, flat ground filling the
+   frame** — good.
+4. **Fast/low FPV footage, horizon in frame, mostly sky/water, heavy motion blur** —
+   expect the quality gate to reject it.
+
+Also required: subjects large enough to detect (people should be more than a few
+pixels — 1080p or better helps), and ground with visible texture (registration
+matches features; bare uniform tarmac/water/snow gives it nothing to grab).
+
+Cuts/edits are handled automatically: the pipeline detects scene cuts and keeps the
+**longest continuous shot**. A burned-in HUD/watermark should be cropped via config
+(section 10, `ingest.crop`).
+
+### 4.2 Add the file
+
+Copy your clip to:
+
+```text
+tempProject\video\drone.mp4
+```
+
+Any container ffmpeg reads is fine (`.mp4`, `.mov`, `.mkv`...). If your file has a
+different name or location, open `config.yaml` and change the first line, e.g.:
+
+```yaml
+input: video/DJI_0042.MP4
+```
+
+Paths in `config.yaml` are relative to the project folder.
+
+---
+
+## 5. First run (fully automatic)
+
+From the project folder, with the venv active:
+
+```bat
+python run.py
+```
+
+What happens, stage by stage (you'll see matching `[stage]` log lines):
+
+| Stage | What it does | Rough time (70 s clip, decent GPU) |
+|---|---|---|
+| `ingest` | reads true fps, finds the longest continuous shot, crops HUD + 10% borders, re-encodes to constant fps, extracts every 6th frame | 1–3 min |
+| `track` | YOLO11m detects + tracks people/vehicles on every frame at `imgsz 1920`; writes mover masks. **First run downloads the model (~40 MB)** | 2–10 min |
+| `calib` | no clicked points yet, so it auto-estimates scale from detected car sizes (falls back to "unscaled" if too few cars) | seconds |
+| `geometry` | registers every extracted frame to the reference frame (chained matching + drift re-anchoring) | 1–5 min |
+| `gate` | computes quality metrics and **stops here if the clip is unusable** | seconds |
+| `mosaic` | builds the ground texture: median of all frames with movers masked out | 1–3 min |
+| `map` | converts pixel tracks to world meters, splits/smooths/stitches them | seconds |
+| `deploy` | copies the results into `UnityProject/Assets/Generated/` | instant |
+
+A successful run ends with a line like:
+
+```text
+[done] scale=auto_scaled. For metric scale: python -m scripts.calibrate, then re-run.
+```
+
+and exit code 0. A gate rejection ends with `FAIL: clip unsuitable` and exit code 2 —
+see section 7.
+
+---
+
+## 6. Understanding the outputs
+
+### 6.1 `out/report.json` — read this first
+
+```json
+{
+  "frames_registered_pct": 84.2,
+  "tracks": 17,
+  "blur_pct": 6.1,
+  "pass": true,
+  "scale_status": "auto_scaled",
+  "ref_index": 141
+}
+```
+
+| Field | Meaning | Healthy value |
+|---|---|---|
+| `frames_registered_pct` | % of frames whose geometry was solved directly (the rest are interpolated) | above 60 (gate threshold), ideally 80+ |
+| `tracks` | number of people/vehicles found | whatever matches reality |
+| `blur_pct` | % of frames that are blurry | below 40 (gate threshold) |
+| `pass` | did the gate accept the clip | `true` |
+| `scale_status` | `metric` (you calibrated) / `auto_scaled` (car-size estimate) / `auto_scaled_lowconf` (estimate, don't trust it) / `unscaled` (consistent but arbitrary units) | `metric` after section 8 |
+| `ref_index` | which extracted frame is the reference (used by the calibration tool) | — |
+
+### 6.2 The three deliverables
+
+- **`out/ground.png`** — top-down ground image in the world frame. Moving objects are
+  erased (per-pixel median over time). Already vertically flipped to match Unity's
+  texture orientation — do not flip it again.
+- **`out/tracks_world.json`** — `{video_fps, tracks: [{id, class, pts: [{t, x, z}]}]}`.
+  `t` is seconds from clip start; `x`/`z` are meters in Unity axes (X = right/east,
+  Z = forward/north). `class` is `person` or `vehicle`.
+- **`out/world_bounds.json`** — `{x0, z0, W_m, H_m, ppm}`: the texture covers the world
+  rectangle from `(x0, z0)` to `(x0+W_m, z0+H_m)` at `ppm` pixels per meter.
+
+All three (bounds merged into `scene_meta.json`) are also copied to
+`UnityProject/Assets/Generated/`.
+
+---
+
+## 7. If the gate FAILs
+
+The pipeline refuses to emit a broken world rather than producing garbage silently.
+Match the failing metric in `out/report.json`:
+
+| Failing metric | Cause | Fix, in order of preference |
+|---|---|---|
+| `frames_registered_pct` low | featureless ground, fast motion, too little overlap between frames | 1) lower `ingest.stride` to 3 or 4 (more overlap); 2) lower `geometry.reanchor_every` to 10; 3) pick a steadier / more textured clip |
+| `tracks` = 0 | subjects too small/blurry, or wrong classes | raise `detect.imgsz` (2560), lower `detect.conf` (0.15); if people are single-digit pixels, no detector saves the clip — use lower-altitude footage |
+| `blur_pct` high | motion blur / low light | slower clip, or (if the metric seems oversensitive on your footage) raise `gates.blur_threshold` |
+
+After changing anything under `ingest:` or `detect:`, rerun with `--force`
+(see section 9). Changes elsewhere just need a plain rerun.
+
+---
