@@ -491,3 +491,173 @@ unity_project: UnityProject   # deploy target; Assets/Generated is created insid
 | `build_target` | `StandaloneWindows64` | Unity build target when building a player |
 
 ---
+
+## 11. Phase 6 - build the Unity scene (ground and agents)
+
+All the C# you need is already written, in `unity_scripts/`. This section takes you
+from "Unity not installed" to markers moving on your ground texture.
+
+### 11.1 Install Unity and create the project
+
+1. Install **Unity Hub** from <https://unity.com/download>, and through it a
+   **Unity 6 LTS** (or 2022.3 LTS) editor with the *Windows Build Support* module.
+2. In Unity Hub: *New project* → **Universal 3D** (URP) template.
+   - **Important:** Unity Hub refuses to create a project in a non-empty folder. If
+     the pipeline already ran, `tempProject\UnityProject` contains `Assets/Generated`
+     and is non-empty. Two clean options:
+     - **Option A (create Unity project first):** create the project at
+       `tempProject\UnityProject` *before* the first pipeline run, then run the
+       pipeline — it deploys into the existing project.
+     - **Option B (create it anywhere):** create the project wherever you like, then
+       either edit `unity_project:` in `config.yaml` to point at it and rerun
+       `python run.py` (deploy stage only takes a second), or just copy the
+       `UnityProject\Assets\Generated` folder into your project's `Assets\`.
+3. Open the project and let it finish importing.
+
+### 11.2 Bring in the scripts and the generated assets
+
+1. Copy the entire `unity_scripts` folder into the Unity project's `Assets\` folder
+   (in Explorer: `...\UnityProject\Assets\unity_scripts\`). Unity compiles it on
+   focus; the `Editor` subfolder inside is picked up as editor code automatically.
+2. Confirm `Assets\Generated\` contains `ground.png`, `tracks_world.json`,
+   `scene_meta.json` (deployed by the pipeline). If not, see 11.1 step 2.
+3. Wait for the compile spinner (bottom-right) to finish. Zero errors expected.
+
+### 11.3 Make the two prefabs (once)
+
+**Person prefab:**
+
+1. *GameObject → Create Empty*, name it `Person`, reset its Transform.
+2. Right-click `Person` → *3D Object → Capsule*. Set the capsule's **Position** to
+   `(0, 0.9, 0)` and **Scale** to `(0.5, 0.9, 0.5)` — a ~1.8 m figure whose base
+   sits at the parent's y=0 (so it stands *on* the ground, not in it).
+3. Select the `Person` root: *Add Component → Rigidbody*, tick **Is Kinematic**
+   (required — zone triggers never fire without a Rigidbody).
+4. *Add Component → Agent Zone Reporter*, leave `objectType` = `person`.
+5. In the Project window create a folder `Assets/Prefabs`, drag `Person` from the
+   Hierarchy into it, then delete `Person` from the Hierarchy.
+
+**Vehicle prefab:** same steps, but the child is a *Cube* with **Position**
+`(0, 0.75, 0)` and **Scale** `(2, 1.5, 4.5)` (width, height, length — length on Z so
+the box faces its direction of travel), and `objectType` = `vehicle`. Save as
+`Assets/Prefabs/Vehicle.prefab`.
+
+### 11.4 Assemble the scene
+
+1. Open `Assets\Generated\scene_meta.json` (it's plain text) and note
+   `x0, z0, W_m, H_m`.
+2. *GameObject → 3D Object → Plane*, name it `Ground`. A Unity plane is 10x10 units,
+   so set:
+   - **Scale** = `(W_m/10, 1, H_m/10)`
+   - **Position** = `(x0 + W_m/2, 0, z0 + H_m/2)`
+   - **Rotation** = `(0, 0, 0)`
+3. In `Assets`, right-click → *Create → Material*, name it `GroundMat`
+   (URP/Lit is the default shader). Set its **Base Map** to `ground.png` and drag the
+   material onto the plane. Do **not** flip or rotate the texture — orientation is
+   pre-baked by the pipeline.
+4. *GameObject → Create Empty*, name it `Playback`, *Add Component → Agent Playback*:
+   - **Tracks Json** = drag `Assets/Generated/tracks_world.json` in
+   - **Person Prefab** / **Vehicle Prefab** = drag the two prefabs in
+   - `timeScale` 1 = real time; 2 = double speed; `loop` on by default
+5. Point a camera at it: select `Main Camera`, set Position
+   `(x0 + W_m/2, max(W_m, H_m), z0 + H_m/2)` and Rotation `(90, 0, 0)` for a
+   top-down view.
+6. Press **Play**: capsules and boxes move across your ground texture along the real
+   paths. Quick sanity check: pick a car visible in the video and confirm its marker
+   drives over the same spot of the texture.
+
+---
+
+## 12. Phase 7 - zones and the detections CSV log
+
+Zones turn the replay into a surveillance log: a timestamped CSV of who was in which
+area when.
+
+### 12.1 Place zones
+
+1. *GameObject → Create Empty*, name it after the area (e.g. `Zone_EntryGate`).
+2. *Add Component → Zone Volume*. A BoxCollider is added automatically with
+   *Is Trigger* already ticked.
+3. Position the object over the area of interest and size the **Box Collider** to
+   cover it. Set the collider's **Size Y** to ~4 and **Center Y** to ~1 so agents
+   moving on the ground actually pass through the volume.
+4. In the ZoneVolume component set:
+   - `zoneType` — `EntryGate` / `Barracks` / `Perimeter` / `Unknown`
+   - `zoneId` — any label you want in the CSV (e.g. `GATE-1`)
+   - `priority` — when zones overlap, the higher number wins in the log
+5. Repeat for as many zones as you want.
+
+### 12.2 Add the logger
+
+*GameObject → Create Empty*, name it `Logger`, *Add Component → Detection Logger*.
+One per scene is enough.
+
+### 12.3 Run and read the log
+
+Press **Play**, let it run, stop. The Console prints the exact file path on start;
+on Windows it is:
+
+```text
+%USERPROFILE%\AppData\LocalLow\DefaultCompany\<ProjectName>\detections.csv
+```
+
+Format, one row per agent per `logInterval` (0.5 s of video time by default,
+adjustable on each prefab's AgentZoneReporter):
+
+```csv
+sim_time,object_type,zone_type,zone_id,x,y,z
+12.50,person,EntryGate,GATE-1,23.41,0.00,8.77
+```
+
+`sim_time` is **video seconds** — it matches the source footage regardless of
+`timeScale`, so "person entered the gate at 12.5 s" can be checked against the video
+directly. Note the file is recreated on every Play; copy it out if you want to keep a
+run.
+
+If nothing ever logs: the agent prefabs are missing their kinematic Rigidbody
+(section 11.3 step 3), or the zone collider is too flat to intersect the agents.
+
+---
+
+## 13. Phase 8 - optional one-command headless build
+
+Instead of assembling the scene by hand (11.4), Unity can do it unattended at the end
+of every pipeline run — useful once you're iterating on clips.
+
+**Prerequisites (once):** sections 11.1–11.3 done (project exists, `unity_scripts`
+copied in, both prefabs saved at `Assets/Prefabs/`), and the project has been opened
+at least once so packages are imported. Unity requires a valid license even in batch
+mode (a free Personal license activated via Unity Hub is fine).
+
+1. Tell the pipeline where Unity.exe lives (one-time, in your terminal session):
+
+   ```bat
+   set UNITY_BIN=C:\Program Files\Unity\Hub\Editor\6000.0.x\Editor\Unity.exe
+   ```
+
+   (Find your exact version folder under `C:\Program Files\Unity\Hub\Editor\`.)
+2. In `config.yaml` set:
+
+   ```yaml
+   unity:
+     run_build: true
+     build_player: false     # true = also produce a runnable Build/app.exe
+     build_target: StandaloneWindows64
+   ```
+
+3. Run `python run.py`. After deploy, Unity launches windowless, executes
+   `BuildRunner.Build` (from `unity_scripts/Editor/`), and saves a ready scene to
+   `Assets/Generated/Recreation.unity` — ground plane, playback driver, logger, and a
+   top-down camera, all positioned from `scene_meta.json`. Open the project and
+   double-click that scene to play it.
+4. With `build_player: true` it additionally compiles a standalone app to
+   `UnityProject\Build\app.exe`.
+
+The editor must be **closed** while the headless build runs (Unity locks the
+project). If the step fails, run the same command by hand to see the log:
+
+```bat
+"%UNITY_BIN%" -batchmode -quit -projectPath UnityProject -executeMethod BuildRunner.Build -logFile -
+```
+
+---
