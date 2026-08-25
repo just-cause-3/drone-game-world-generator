@@ -326,3 +326,168 @@ After changing anything under `ingest:` or `detect:`, rerun with `--force`
 (see section 9). Changes elsewhere just need a plain rerun.
 
 ---
+
+## 8. Metric calibration (optional but recommended)
+
+The first run guesses scale from car sizes. For **real meters** (correct distances,
+speeds, zone sizes), click 4+ known ground points once:
+
+### 8.1 Find real-world coordinates for 4 points
+
+Pick 4+ points on the **ground** that you can recognize in the video *and* whose
+mutual distances you know — parking-lot corners, lane markings, a building's base
+corners. Two easy sources:
+
+- **A known rectangle:** if a lot is 50 m x 30 m, its corners are
+  `(0,0)`, `(50,0)`, `(50,30)`, `(0,30)`.
+- **Google Maps:** right-click → *Measure distance* between your chosen landmarks,
+  then assign coordinates consistent with those distances.
+
+Convention: **X = right/east, Z = forward/north, meters.** Pick any point as origin
+`(0,0)`. Spread the points out (never all on one line — collinear points are rejected).
+
+### 8.2 Run the click tool
+
+```bat
+python -m scripts.calibrate
+```
+
+1. A window opens showing the **reference frame** (the same one the pipeline used —
+   it may open behind other windows; check the taskbar).
+2. **Click** a landmark in the image.
+3. **Switch to the terminal** — it now asks
+   `point 0 at pixel (812,455) -> world X Z [m]:` — type the two numbers separated by
+   a space, e.g. `0 0`, press Enter.
+4. Repeat for each point (4 minimum, more is better). The image window annotates each
+   accepted point.
+5. Keys: **`s`** = save (only with 4+ points), **`u`** = undo last point,
+   **`Esc`** = abort without saving.
+
+Saving writes `out/calibration.json`. The points are **bound to that exact reference
+frame** (by filename + content hash): the pipeline will refuse to run if the frame
+ever changes underneath them, instead of silently producing a shifted world.
+
+### 8.3 Re-run
+
+```bat
+python run.py
+```
+
+Frame extraction and tracking are reused automatically — only geometry onward
+recomputes (fast). `report.json` now shows `"scale_status": "metric"`.
+
+**When to recalibrate:** if you change the input video, `ingest.crop`,
+`ingest.border_crop_pct`, or `ingest.stride`, the frames change, the binding check
+fires, and the run stops with a clear message. Delete `out\calibration.json`, run the
+pipeline once, then redo 8.2.
+
+---
+
+## 9. Re-running: what is cached and when to use --force
+
+To keep iteration fast, two expensive stages are cached:
+
+| Cached artifact | Stage skipped when present | Invalidate by |
+|---|---|---|
+| `out/shot_clean.mp4` + `frames/` | ingest | `--force` |
+| `out/tracks_image.json` + `masks/` | tracking | `--force`, or delete just `out\tracks_image.json` to redo tracking without re-ingesting |
+
+Geometry, gate, mosaic, and mapping **always** recompute — they're fast.
+
+Rules of thumb:
+
+- Changed anything under `ingest:` (or swapped the video)? → `python run.py --force`
+- Changed anything under `detect:`? → `del out\tracks_image.json` then `python run.py`
+- Changed `geometry:` / `calibrate:` / `mosaic:` / `map:` / `gates:`? → plain `python run.py`
+- Not sure? `--force` is always correct, just slower.
+
+The stride guard: if `frames/` on disk were extracted with a different `stride` than
+the config now says, the run **stops** and tells you to use `--force` — mismatched
+stride would silently pair frames with the wrong masks.
+
+---
+
+## 10. Every config option explained
+
+`config.yaml`, section by section:
+
+```yaml
+input: video/drone.mp4    # your clip, relative to the project folder
+work_dir: out             # where intermediate + final artifacts go
+unity_project: UnityProject   # deploy target; Assets/Generated is created inside it
+```
+
+### ingest
+
+| Key | Default | What it does |
+|---|---|---|
+| `split_on_cuts` | `true` | detect scene cuts, keep the longest continuous shot (registration/tracking break across cuts) |
+| `crop` | `null` | ffmpeg crop for burned-in HUDs, e.g. `"in_w:in_h-80:0:0"` removes the bottom 80 px |
+| `border_crop_pct` | `10` | crops N% off every border — cheap lens-distortion mitigation (homographies assume a pinhole camera; wide drone lenses bend the edges). `0` disables |
+| `stride` | `6` | geometry runs on every Nth video frame. Lower = more overlap = more robust registration, more compute. At 30 fps, 6 → 5 fps |
+
+### detect
+
+| Key | Default | What it does |
+|---|---|---|
+| `model` | `yolo11m.pt` | detector; `yolo11l.pt` if your GPU has headroom |
+| `imgsz` | `1920` | inference resolution. The stock 640 destroys 10–25 px people; raise to 2560 for very high/small subjects |
+| `device` | `auto` | `auto` picks CUDA → Apple MPS → CPU; or force `0` / `"cpu"` |
+| `conf` | `0.25` | detection confidence threshold; lower finds more (and more false) objects |
+| `dynamic_classes` | `[0,1,2,3,5,7]` | COCO ids: person, bicycle, car, motorcycle, bus, truck |
+| `mask_dilate_px` | `25` | grows the mover masks so moving *shadows* don't corrupt registration or the mosaic |
+| `foot_shift` | `{person: 0.02, vehicle: 0.18}` | moves the tracked ground point up from the box's bottom edge (fraction of box height). At oblique angles the box bottom is the object's *near edge*, not its center — wrong shift makes parked cars trace little circles during orbits |
+
+### geometry
+
+| Key | Default | What it does |
+|---|---|---|
+| `ref_frame` | `auto` | reference frame choice (most ORB features). Ignored once `out/calibration.json` exists — the binding wins |
+| `min_matches` | `12` | minimum feature matches to even attempt a homography |
+| `min_inliers` | `15` | below this a frame counts as unregistered and gets interpolated |
+| `reanchor_every` | `25` | every N frames, try a direct match to the reference to kill accumulated drift; lower if the mosaic smears over long clips |
+| `orb_features` | `5000` | features per frame; raise for low-texture ground |
+
+### calibrate
+
+| Key | Default | What it does |
+|---|---|---|
+| `auto` | `car_size` | fallback when no clicked points exist: `car_size` estimates pixels-per-meter from detected cars (orientation-filtered); `unscaled` skips estimation |
+| `ppm` | `20` | ground-texture resolution in pixels per meter (also the fallback scale for `unscaled`) |
+
+### mosaic
+
+| Key | Default | What it does |
+|---|---|---|
+| `max_frames` | `60` | frames used in the median (evenly sampled; 60 is statistically plenty) |
+| `max_canvas_px` | `6000` | texture size cap; `ppm` is auto-reduced if the world is too large |
+| `tile` | `512` | median is computed in tiles to bound memory; lower to 256 if you hit RAM limits |
+| `margin_m` | `5` | padding around the auto-computed world bounds |
+
+### map
+
+| Key | Default | What it does |
+|---|---|---|
+| `smooth_window` | `5` | moving-average window (samples) on world tracks |
+| `max_gap_s` | `0.5` | a track with a time hole bigger than this is split before smoothing (never smooth across an occlusion) |
+| `stitch_gaps` | `true` | rejoin split segments when plausible |
+| `max_stitch_gap_s` | `3.0` | never stitch across a longer gap |
+| `max_speed` | `{person: 3.0, vehicle: 15.0}` | m/s plausibility gate for stitching (a person can't cover 10 m in 0.3 s) |
+
+### gates
+
+| Key | Default | What it does |
+|---|---|---|
+| `min_frames_registered_pct` | `60` | reject if fewer % of frames registered directly |
+| `min_tracks` | `1` | reject if nothing was detected |
+| `max_blur_pct` | `40` | reject if more % of frames are blurry |
+| `blur_threshold` | `100.0` | Laplacian-variance blur cutoff (higher = stricter) |
+
+### unity
+
+| Key | Default | What it does |
+|---|---|---|
+| `run_build` | `false` | if `true`, launches Unity in batch mode after deploy (requires Unity installed and a `BuildRunner.cs` in the project; set the `UNITY_BIN` env var if `Unity` isn't on PATH) |
+| `build_target` | `StandaloneWindows64` | Unity build target when building a player |
+
+---
