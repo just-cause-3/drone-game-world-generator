@@ -661,3 +661,128 @@ project). If the step fails, run the same command by hand to see the log:
 ```
 
 ---
+
+## 14. Phase 9 - validate the result
+
+Five checks, in order of payoff. Do 14.1 once per calibration; the rest when something
+looks off.
+
+### 14.1 Probe spheres (catches orientation/mirror bugs)
+
+1. Take two of your calibration points (section 8) — you know their exact `(X, Z)`.
+   If you used auto-scale, pick two landmarks you can identify on `ground.png` and
+   estimate their world coords from `world_bounds.json` proportions.
+2. In Unity: *GameObject → 3D Object → Sphere*, position `(X, 0.5, Z)`, bright
+   material. Repeat for the second point.
+3. Look straight down. Each sphere must sit on the matching landmark **of the
+   rendered texture**.
+   - Spheres mirrored *relative to the texture* → someone flipped/rotated the
+     texture or plane in Unity; undo it (the pipeline pre-bakes orientation).
+   - Spheres consistent with the texture, but the whole world is mirrored *versus
+     reality* → negate one axis in your calibration points (all `Z` → `-Z`),
+     recalibrate, re-run.
+
+### 14.2 Scale check
+
+A car marker is 4.5 m long. Compare it against the painted parking bays / lane widths
+on the texture — cars roughly filling a bay means scale is right. With `metric`
+calibration you can be exact: place two spheres at `(0,0)` and `(10,0)` and check the
+gap spans 10 m worth of texture.
+
+### 14.3 Stationary-object check (geometry + foot point)
+
+Find a **parked** car's marker and watch it for the whole clip. It should not move.
+
+- Slow drift + sudden snap back → registration gaps: see section 15, first row.
+- Small circular wobble (on orbiting footage) → tune `detect.foot_shift` for
+  `vehicle` until the circle collapses to a point, then `python run.py` (tracking
+  cache makes this fast — but foot_shift lives in tracking, so
+  `del out\tracks_image.json` first).
+
+### 14.4 Track sanity
+
+Watch the playback: motion should be smooth and plausible. Teleporting agents →
+check `frames_registered_pct` in the report; one real person flickering between two
+markers → loosen stitching (`map.max_stitch_gap_s` up, or check `map.max_speed`).
+
+### 14.5 Overlay check (the full-loop test)
+
+Screenshot the Unity top view at some sim-time `T`, pause the source video at the
+same `T`, and compare side by side: static features aligned, every real mover having
+a marker near its true position. This is the closest thing to a ground-truth test the
+schematic approach has — if it passes, the recreation is as good as this method gets.
+
+---
+
+## 15. Tuning guide (symptom → knob)
+
+| You see | Cause | Change |
+|---|---|---|
+| Agents drift then snap back | stretches of unregistered frames | lower `ingest.stride`; lower `geometry.reanchor_every` |
+| Parked cars trace small circles | foot point sits on the box's near edge at oblique angles | tune `detect.foot_shift` (vehicle) until a parked car's track collapses to a point |
+| Ghost cars/people in `ground.png` | movers not fully masked | raise `detect.mask_dilate_px`; lower `detect.conf` |
+| Jittery agents | track noise | raise `map.smooth_window` |
+| One person becomes several agents | occlusion split the track and stitching was too strict | raise `map.max_stitch_gap_s`; check `map.max_speed` |
+| Too few detections | subjects too small | raise `detect.imgsz`; lower `detect.conf`; larger `detect.model` |
+| Mosaic edges look bent/misaligned | lens distortion | raise `ingest.border_crop_pct` to 15 (then `--force`) |
+| Texture too coarse | resolution cap | raise `calibrate.ppm` and/or `mosaic.max_canvas_px` |
+| Run is slow on the mosaic / RAM spikes | large canvas | lower `mosaic.max_frames` (30), lower `mosaic.tile` (256) |
+
+---
+
+## 16. Troubleshooting
+
+| Error / symptom | Fix |
+|---|---|
+| `'py' is not recognized` | Python not installed or PATH box wasn't ticked — reinstall Python, tick *Add to PATH*, open a new terminal |
+| `ffprobe failed - is ffmpeg installed and on PATH?` | Section 3.2; remember to open a **new** terminal after installing |
+| `ModuleNotFoundError: No module named 'ultralytics'` (or cv2/yaml) | venv not activated (`.venv\Scripts\activate.bat`) or `pip install -r requirements.txt` skipped |
+| `torch.cuda.is_available()` prints `False` | CPU wheel got installed. Fix: `pip uninstall torch torchvision` then redo section 3.4. Also update the NVIDIA driver |
+| Tracking crawls (minutes per second of video) | you're on CPU — same fix as above; confirm the `[track] ... device=0` log line |
+| First run stalls at `track` with a download bar | it's fetching `yolo11m.pt` (~40 MB) — needs internet once |
+| `FAIL: clip unsuitable` | section 7 |
+| `frames/ were extracted with stride X but config says Y` | intentional guard — run `python run.py --force` |
+| `calibration is bound to a frame that no longer exists` / `content changed` | frames were re-extracted since you calibrated — `del out\calibration.json`, run once, recalibrate (section 8) |
+| Click-tool window is frozen/white | it's waiting for your terminal input — finish typing the `X Z` values in the terminal |
+| Click-tool window never appears | check the taskbar; it can open behind the terminal |
+| World is mirrored compared to reality | negate one axis in your calibration points (e.g. all `Z` → `-Z`), recalibrate, re-run |
+| Agents walk mirrored **relative to the texture** | should not happen (the flip is baked in); if you flipped/rotated `ground.png` manually in Unity, undo that |
+| `only N frames extracted` | clip too short after cut-splitting — check `out/shot_clean.mp4` is the shot you expected |
+| Antivirus flags/slows the run | first-run model download + many small mask files; exclude the project folder if needed |
+| Unity: zone log stays empty | agent prefabs missing the **kinematic Rigidbody** (11.3), no `DetectionLogger` in the scene (12.2), or zone collider too flat (12.1) |
+| Unity Hub: "folder is not empty" when creating the project | the pipeline already deployed into `UnityProject/` — use Option A or B in section 11.1 |
+| Headless build fails / `BuildRunner` not found | `unity_scripts` not copied into `Assets` (11.2), editor still open (close it), `UNITY_BIN` wrong, or no Unity license activated |
+
+---
+
+## 17. How the pipeline works internally
+
+Thirty-second version, for debugging with understanding:
+
+1. **One clock, one index.** Everything is keyed by the video frame number `n` at the
+   normalized fps. Extracted frame *i* **is** video frame `(i-1)*stride`; the mask for
+   it is `masks/frame_{n:06d}.png`; a detection at frame `n` gets the homography
+   interpolated at `n/stride`. No stage declares its own frame rate — this kills a
+   whole class of silent misalignment bugs.
+2. **Two layers.** The *static* world (ground) and the *dynamic* world (movers) are
+   built separately from the same footage: movers are masked out of the ground
+   texture, and the same detections drive the animated agents.
+3. **Geometry.** Because the ground is (roughly) flat, every frame relates to a
+   reference frame by a homography. Frames are registered in a *chain* (neighbor to
+   neighbor — always high overlap), periodically re-anchored to the reference to
+   bound drift; failures are interpolated, never faked with a stale matrix.
+   Calibration (clicked points or car-size estimate) converts the reference frame's
+   pixels to meters; composing the two gives pixel→meter for every frame.
+4. **Ground texture.** Every frame is warped into the world rectangle (auto-computed
+   from the footage) and the per-pixel **median** over time is taken with movers
+   masked — moving objects simply vanish. The result is flipped once to match Unity's
+   texture orientation.
+5. **Tracks.** Foot points (bottom-center of each detection, shifted for oblique
+   views) go through the interpolated homographies into meters, get split at
+   occlusion gaps, smoothed per segment, and stitched back when physically plausible.
+6. **The gate.** Registration %, track count, and blur decide whether the result is
+   trustworthy; the pipeline reports instead of silently emitting a broken world.
+
+For the full design rationale, see the implementation plan document
+(*"Drone Video to Unity Implementation Plan"* — v3, hardened edition) and its
+companion *"Issues and Fixes"* review.
