@@ -4,6 +4,26 @@ __pycache__/
 
 # Generated computer-vision artifacts
 out/
+stage1_out/
 frames/
 masks/
 *.pt
+.tmp/
+
+# Local input footage is large and may have redistribution/privacy constraints.
+# Existing repository samples remain tracked; new clips stay local.
+sample_vids/*.mp4
+
+# Unity-generated caches
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# Imported Stage 1 bundles are reproducible and can contain large images/videos.
+/UnityProject/DroneWorldRecreation/Assets/Generated/
+/UnityProject/DroneWorldRecreation/Assets/Scenes/Stage1Preview.unity*
+
+# Superseded experimental Unity project retained locally for reference only.
+/UnityProject/My project/
