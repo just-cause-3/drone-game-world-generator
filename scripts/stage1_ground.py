@@ -151,3 +151,91 @@ class Stage1Options:
             raise ValueError("max_inpaint_component_pct cannot be negative")
         if self.residual_repair_passes < 0:
             raise ValueError("residual_repair_passes cannot be negative")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _video_timing(path: Path, jitter_pct: float):
+    """Inspect actual presentation timestamps instead of trusting container FPS fields."""
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,avg_frame_rate,width,height,duration",
+        "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", str(path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("ffprobe failed: " + result.stderr[-500:])
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    timestamps = [float(frame["best_effort_timestamp_time"])
+                  for frame in data.get("frames", [])
+                  if frame.get("best_effort_timestamp_time") is not None]
+    if not streams or len(timestamps) < 2:
+        raise RuntimeError("video has no usable timestamp sequence")
+    deltas = np.diff(np.asarray(timestamps, np.float64))
+    deltas = deltas[deltas > 0]
+    if not len(deltas):
+        raise RuntimeError("video timestamps are not increasing")
+    median_dt = float(np.median(deltas))
+    deviations = np.abs(deltas - median_dt) / median_dt * 100.0
+    variable = bool(np.percentile(deviations, 99) > jitter_pct)
+    return {
+        "timestamp_count": len(timestamps),
+        "median_frame_duration_s": median_dt,
+        "measured_fps": 1.0 / median_dt,
+        "timestamp_jitter_p99_pct": float(np.percentile(deviations, 99)),
+        "variable_frame_rate": variable,
+        "stream": streams[0],
+    }
+
+
+def _prepare_cfr(source: Path, temp_dir: Path, options: Stage1Options):
+    timing = _video_timing(source, options.timestamp_jitter_pct)
+    if not timing["variable_frame_rate"]:
+        return source, timing, False
+    normalized = temp_dir / "video_cfr.mp4"
+    fps = timing["measured_fps"]
+    command = [
+        "ffmpeg", "-y", "-v", "error", "-i", str(source),
+        "-vf", f"fps={fps:.9f}", "-an", "-c:v", "libx264", "-crf", "15",
+        "-preset", "fast", "-pix_fmt", "yuv420p", str(normalized),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("CFR normalization failed: " + result.stderr[-500:])
+    return normalized, timing, True
+
+
+def _detect_scene_cuts(path: Path):
+    try:
+        from scenedetect import AdaptiveDetector, detect
+    except ImportError as exc:
+        raise RuntimeError("scenedetect is required for Stage 1") from exc
+    scenes = detect(str(path), AdaptiveDetector(), show_progress=False)
+    if len(scenes) <= 1:
+        return []
+    return [round(float(scene[1].get_seconds()), 4) for scene in scenes[:-1]]
+
+
+def _video_info(path: Path):
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"could not open video: {path}")
+    try:
+        info = {
+            "frame_count": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+            "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        }
+    finally:
+        cap.release()
+    if any(info[key] <= 0 for key in info):
+        raise RuntimeError("video metadata is incomplete or invalid")
+    return info
