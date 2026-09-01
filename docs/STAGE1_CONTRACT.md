@@ -62,3 +62,79 @@ without rewriting its manifest. Consumers must stop unless `pass` is `true`.
 Outputs are staged in a temporary sibling directory and replace the previous bundle as
 one publication operation. This prevents a later stage from reading a mixture of old and
 new artifacts.
+
+## Foreground definition
+
+The default static world keeps roads, markings, pavements, vegetation, structures, and
+non-car vehicle types. It excludes only pedestrians (`pedestrian` and `people`) and
+`car`. The `person` alias is accepted when an explicitly selected COCO checkpoint is
+used. Bicycles, motorcycles, vans, trucks, buses, tricycles, and `others` are not masked.
+Class names are matched by name rather than numeric ID so a COCO class map cannot
+silently be applied to VisDrone weights.
+
+Inference combines a whole-frame pass with overlapping 640 px crops resized to 1280 px,
+uses test-time augmentation, and performs global class-agnostic NMS before the masks are
+created. The mask threshold is intentionally recall-oriented (`0.08`); the final static
+plate residual gate uses the more precision-oriented `0.25`. Box padding and dilation
+cover the full actor silhouette and small registration errors. These defaults trade
+runtime for small-object recall.
+
+If the final detector finds a small residual car or pedestrian, Stage 1 may perform up
+to two additional conservative repair passes. Those pixels count toward the same 2%
+total inpainting limit, large components remain unresolved, and the final plate must be
+checked again by the detector before it can pass.
+
+This is a project policy, not an inherent truth: decide before the next stage whether
+parked vehicles should be part of the world or removed as actors. No detector guarantees
+perfect detection, especially for a new altitude, camera, geography, or lighting. The
+overlay, masks, temporal frequency, and final plate therefore remain required review
+artifacts. The report records the exact weight SHA-256, model class map, thresholds, and
+inference strategy for reproducibility.
+
+Install/verify the pinned checkpoint with:
+
+```powershell
+.venv\Scripts\python.exe setup_drone_model.py
+```
+
+`train_drone_model.py` can reproduce a VisDrone fine-tune from an official Ultralytics
+base model. A production detector should ultimately be fine-tuned on annotated frames
+from the actual camera, altitude, and target environment, then evaluated against a
+held-out project-specific set before replacing the pinned baseline.
+
+The pinned checkpoint and Ultralytics implementation are AGPL-3.0 licensed. Resolve
+distribution/licensing requirements before the generated application is shipped.
+
+## What must be defined for metric Unity coordinates
+
+Stage 1 deliberately stops in pixels. Before building Unity geometry, define:
+
+1. At least four well-spread, non-collinear ground control points. For every point,
+   record its reference-image pixel `(u, v)` and matching real ground coordinate
+   `(X, Z)` in meters. Surveyed points are best; known corners or road-marking
+   intersections are practical alternatives.
+2. A world origin, such as one chosen control point at `(0, 0)`.
+3. Axis directions. Recommended: Unity `+X` is east/right, `+Y` is up, and `+Z` is
+   north/forward. Image `v` points downward, so it must not be copied directly to `Z`.
+4. Ground elevation. Use `Y = 0` for the first flat-world version.
+5. The intended static-world policy, especially whether stationary vehicles, people,
+   temporary objects, trees, and shadows belong in the generated world.
+
+The next calibration artifact should be `world_calibration.json`, versioned separately,
+and contain the control points, a 3x3 `reference_pixel_to_world_xz` homography, reprojection
+RMSE, world bounds, axis convention, and units. Four or more points allow slight residual
+perspective to be represented and independently checked. One known distance can estimate
+meters per pixel, but it cannot validate skew or perspective and is not recommended for
+the final reconstruction.
+
+For a point `p = [u, v, 1]` observed in CFR frame `n`, the later pipeline composes:
+
+```text
+p_reference = frame_transforms_to_reference[n] @ p
+p_world_xz   = reference_pixel_to_world_xz @ p_reference
+p_world_xz  /= p_world_xz[2]
+unity        = (p_world_xz[0], 0, p_world_xz[1])
+```
+
+This single, explicit transform chain prevents the vertical flips and mixed coordinate
+conventions present in the legacy implementation.
