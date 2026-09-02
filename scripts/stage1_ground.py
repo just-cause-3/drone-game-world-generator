@@ -469,3 +469,48 @@ def _semantic_exclusion(foreground: np.ndarray, accepted: np.ndarray,
         return np.zeros(foreground.shape[1:], bool), required
     detections = np.asarray(foreground[accepted], dtype=bool)
     return np.count_nonzero(detections, axis=0) >= required, required
+
+
+def _publish_directory(staging: Path, output: Path):
+    """Replace a generated output directory with rollback if the rename fails."""
+    backup = output.with_name(f".{output.name}.backup-{uuid.uuid4().hex}")
+    had_output = output.exists()
+    if had_output:
+        if not output.is_dir():
+            raise OSError(f"output path exists and is not a directory: {output}")
+        os.replace(output, backup)
+    try:
+        os.replace(staging, output)
+    except Exception:
+        if had_output and backup.exists():
+            os.replace(backup, output)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+
+
+def _validate_output_target(source: Path, output: Path):
+    """Refuse broad or unrelated directories before atomic replacement."""
+    if output == Path(output.anchor):
+        raise ValueError("Stage 1 output cannot be a filesystem root")
+    if source == output or (source.exists() and source.is_relative_to(output)):
+        raise ValueError("Stage 1 output cannot contain the input video")
+    if not output.exists():
+        return
+    if not output.is_dir():
+        raise ValueError(f"Stage 1 output exists and is not a directory: {output}")
+    if not any(output.iterdir()):
+        return
+    marker = output / ".stage1-output"
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == SCHEMA_VERSION:
+        return
+    report_path = output / "report.json"
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = {}
+        if report.get("schema_version") == SCHEMA_VERSION:
+            return
+    raise ValueError(
+        f"refusing to replace nonempty directory that is not a {SCHEMA_VERSION} bundle: {output}")
