@@ -273,3 +273,146 @@ def _class_agnostic_nms(candidates: list[dict], iou: float) -> list[dict]:
         return []
     flattened = np.asarray(indices).reshape(-1)
     return [candidates[int(index)] for index in flattened]
+
+
+def _detection_preview(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
+    preview = frame.copy()
+    for detection in detections:
+        x1, y1, x2, y2 = detection["bbox_xyxy"]
+        color = (30, 220, 255)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), color, 2)
+        label = f'{detection["class"]} {detection["confidence"]:.2f}'
+        cv2.putText(preview, label, (x1, max(14, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    return preview
+
+
+class _YoloForegroundMasker:
+    def __init__(self, options: Stage1Options):
+        from ultralytics import YOLO
+        from .track_agents import resolve_device
+
+        self.options = options
+        self.device = resolve_device("auto")
+        requested = Path(str(options.foreground_model))
+        repository_model = Path(__file__).resolve().parents[1] / requested
+        model_source = (repository_model if not requested.is_absolute() and
+                        repository_model.exists() else requested)
+        if (str(options.foreground_model) == DEFAULT_FOREGROUND_MODEL and
+                not model_source.exists()):
+            raise FileNotFoundError(
+                f"drone detector is missing: {repository_model}. "
+                "Run '.venv\\Scripts\\python.exe setup_drone_model.py' once.")
+        log("stage1", f"foreground model={model_source} device={self.device}; "
+                      f"full_frame={options.foreground_full_frame}, "
+                      f"tile={options.foreground_tile_size}, tta={options.foreground_tta}")
+        self.model_source = str(model_source)
+        self.model = YOLO(self.model_source)
+        raw_names = self.model.names
+        self.model_names = {
+            int(class_id): str(name) for class_id, name in
+            (raw_names.items() if isinstance(raw_names, dict) else enumerate(raw_names))
+        }
+        self.selected_names = {
+            _normalized_class_name(name) for name in options.foreground_class_names
+        }
+        available = {_normalized_class_name(name) for name in self.model_names.values()}
+        if not self.selected_names.intersection(available):
+            raise ValueError(
+                "foreground model has no requested actor classes; "
+                f"model classes={sorted(available)}")
+
+    @property
+    def metadata(self):
+        path = Path(self.model_source)
+        return {
+            "model": self.model_source,
+            "model_sha256": _file_sha256(path) if path.is_file() else None,
+            "device": str(self.device),
+            "model_classes": self.model_names,
+            "selected_classes": sorted(self.selected_names),
+            "confidence": self.options.foreground_conf,
+            "residual_confidence": self.options.residual_foreground_conf,
+            "iou": self.options.foreground_iou,
+            "imgsz": self.options.foreground_imgsz,
+            "full_frame": self.options.foreground_full_frame,
+            "tile_size": self.options.foreground_tile_size,
+            "tile_overlap": self.options.foreground_tile_overlap,
+            "test_time_augmentation": self.options.foreground_tta,
+        }
+
+    def _predict(self, image: np.ndarray, offset_x: int, offset_y: int,
+                 inference_pass: str, confidence: float) -> list[dict]:
+        result = self.model.predict(
+            image, imgsz=self.options.foreground_imgsz,
+            conf=confidence, iou=self.options.foreground_iou,
+            max_det=self.options.foreground_max_det, device=self.device,
+            augment=self.options.foreground_tta, agnostic_nms=True,
+            end2end=False, verbose=False)[0]
+        candidates = []
+        if result.boxes is None:
+            return candidates
+        for box, cls, confidence in zip(result.boxes.xyxy.cpu().numpy(),
+                                        result.boxes.cls.cpu().numpy(),
+                                        result.boxes.conf.cpu().numpy()):
+            class_id = int(cls)
+            class_name = self.model_names.get(class_id, str(class_id))
+            if _normalized_class_name(class_name) not in self.selected_names:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in box)
+            candidates.append({
+                "class_id": class_id,
+                "class": class_name,
+                "confidence": float(confidence),
+                "bbox_xyxy": [x1 + offset_x, y1 + offset_y,
+                              x2 + offset_x, y2 + offset_y],
+                "inference_pass": inference_pass,
+            })
+        return candidates
+
+    def mask(self, frame: np.ndarray, confidence: float | None = None):
+        height, width = frame.shape[:2]
+        confidence = self.options.foreground_conf if confidence is None else confidence
+        candidates = []
+        if self.options.foreground_full_frame:
+            candidates.extend(self._predict(frame, 0, 0, "full", confidence))
+        tile_size = self.options.foreground_tile_size
+        tiled = tile_size > 0 and (width > tile_size or height > tile_size)
+        if tiled:
+            tile_width = min(tile_size, width)
+            tile_height = min(tile_size, height)
+            x_origins = _tile_origins(width, tile_width,
+                                      self.options.foreground_tile_overlap)
+            y_origins = _tile_origins(height, tile_height,
+                                      self.options.foreground_tile_overlap)
+            for y0 in y_origins:
+                for x0 in x_origins:
+                    crop = frame[y0:y0 + tile_height, x0:x0 + tile_width]
+                    candidates.extend(self._predict(
+                        crop, x0, y0, f"tile:{x0},{y0}", confidence))
+        if not self.options.foreground_full_frame and not tiled:
+            candidates.extend(self._predict(frame, 0, 0, "single", confidence))
+
+        merged = _class_agnostic_nms(candidates, self.options.foreground_iou)
+        mask = np.zeros(frame.shape[:2], np.uint8)
+        detections = []
+        for candidate in merged:
+            x1, y1, x2, y2 = candidate["bbox_xyxy"]
+            pad_x = (x2 - x1) * self.options.foreground_box_padding_fraction
+            pad_y = (y2 - y1) * self.options.foreground_box_padding_fraction
+            x1 = max(0, int(math.floor(x1 - pad_x)))
+            y1 = max(0, int(math.floor(y1 - pad_y)))
+            x2 = min(width - 1, int(math.ceil(x2 + pad_x)))
+            y2 = min(height - 1, int(math.ceil(y2 + pad_y)))
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            detections.append({
+                "class_id": candidate["class_id"],
+                "class": candidate["class"],
+                "confidence": round(candidate["confidence"], 4),
+                "bbox_xyxy": [x1, y1, x2, y2],
+            })
+        radius = self.options.foreground_dilate_px
+        if radius and np.any(mask):
+            size = 2 * radius + 1
+            mask = cv2.dilate(mask, np.ones((size, size), np.uint8))
+        return mask, detections
