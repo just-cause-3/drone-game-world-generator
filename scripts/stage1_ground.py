@@ -416,3 +416,56 @@ class _YoloForegroundMasker:
             size = 2 * radius + 1
             mask = cv2.dilate(mask, np.ones((size, size), np.uint8))
         return mask, detections
+
+
+def _interpolate_frame_transforms(frame_count: int, sample_indices: np.ndarray,
+                                  transforms: np.ndarray, accepted: np.ndarray):
+    """Interpolate similarity parameters onto every CFR frame for later stages."""
+    slots = np.flatnonzero(accepted)
+    if len(slots) < 2:
+        raise ValueError("at least two accepted transforms are needed for interpolation")
+    known_frames = sample_indices[slots].astype(np.float64)
+    query = np.arange(frame_count, dtype=np.float64)
+    values = np.column_stack([
+        transforms[slots, 0, 0], transforms[slots, 1, 0],
+        transforms[slots, 0, 2], transforms[slots, 1, 2],
+    ])
+    interpolated = np.column_stack([
+        np.interp(query, known_frames, values[:, column]) for column in range(4)
+    ])
+    result = np.zeros((frame_count, 3, 3), np.float64)
+    result[:, 0, 0] = interpolated[:, 0]
+    result[:, 0, 1] = -interpolated[:, 1]
+    result[:, 1, 0] = interpolated[:, 1]
+    result[:, 1, 1] = interpolated[:, 0]
+    result[:, 0, 2] = interpolated[:, 2]
+    result[:, 1, 2] = interpolated[:, 3]
+    result[:, 2, 2] = 1.0
+    return result
+
+
+def _inpaint_small_holes(image: np.ndarray, holes: np.ndarray,
+                         options: Stage1Options):
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(holes.astype(np.uint8), 8)
+    eligible = np.zeros_like(holes, np.uint8)
+    max_area = image.shape[0] * image.shape[1] * options.max_inpaint_component_pct / 100.0
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_AREA] <= max_area:
+            eligible[labels == label] = 255
+    repaired = image
+    if np.any(eligible):
+        repaired = cv2.inpaint(image, eligible, options.inpaint_radius_px, cv2.INPAINT_TELEA)
+    unresolved = holes & (eligible == 0)
+    return repaired, eligible, unresolved
+
+
+def _semantic_exclusion(foreground: np.ndarray, accepted: np.ndarray,
+                        options: Stage1Options):
+    """Find repeatedly detected actors that a median could otherwise preserve."""
+    accepted_count = int(np.count_nonzero(accepted))
+    required = max(options.min_semantic_consensus_frames,
+                   int(math.ceil(accepted_count * options.semantic_consensus_fraction)))
+    if accepted_count < required:
+        return np.zeros(foreground.shape[1:], bool), required
+    detections = np.asarray(foreground[accepted], dtype=bool)
+    return np.count_nonzero(detections, axis=0) >= required, required
