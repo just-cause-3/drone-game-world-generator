@@ -514,3 +514,63 @@ def _validate_output_target(source: Path, output: Path):
             return
     raise ValueError(
         f"refusing to replace nonempty directory that is not a {SCHEMA_VERSION} bundle: {output}")
+
+
+def _sample_indices(frame_count: int, requested: int) -> np.ndarray:
+    if frame_count < 5:
+        raise ValueError(f"video is too short: only {frame_count} frames")
+    return np.unique(np.linspace(0, frame_count - 1, min(frame_count, requested)).astype(int))
+
+
+def _decode_samples(video: Path, indices: np.ndarray, storage: np.memmap):
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise RuntimeError(f"could not open video: {video}")
+    wanted = {int(frame_number): slot for slot, frame_number in enumerate(indices)}
+    decoded = 0
+    frame_number = 0
+    try:
+        while wanted:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            slot = wanted.pop(frame_number, None)
+            if slot is not None:
+                if frame.shape != storage.shape[1:]:
+                    raise RuntimeError("video dimensions changed while decoding")
+                storage[slot] = frame
+                decoded += 1
+            frame_number += 1
+    finally:
+        cap.release()
+    storage.flush()
+    if wanted:
+        missing = sorted(wanted)[:5]
+        raise RuntimeError(f"failed to decode sampled video frames: {missing}")
+    return decoded
+
+
+def _sharpness(frame: np.ndarray, valid_mask: np.ndarray | None = None) -> float:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    if valid_mask is None:
+        return float(laplacian.var())
+    interior = cv2.erode(valid_mask.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    values = laplacian[interior]
+    return float(values.var()) if values.size else 0.0
+
+
+def _reference_slot(frames: np.memmap, blur_threshold: float) -> int:
+    """Use the temporal center unless it is genuinely blurred.
+
+    Picking the absolute sharpest frame biased the reference toward one end of clips
+    with a slow altitude change, unnecessarily reducing overlap at the opposite end.
+    """
+    count = len(frames)
+    center = count // 2
+    center_sharpness = _sharpness(np.asarray(frames[center]))
+    if center_sharpness >= blur_threshold:
+        return center
+    radius = max(1, count // 10)
+    candidates = range(max(0, center - radius), min(count, center + radius + 1))
+    return max(candidates, key=lambda i: _sharpness(np.asarray(frames[i])))
