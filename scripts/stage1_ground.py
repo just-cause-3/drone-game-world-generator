@@ -239,3 +239,37 @@ def _video_info(path: Path):
     if any(info[key] <= 0 for key in info):
         raise RuntimeError("video metadata is incomplete or invalid")
     return info
+
+
+def _normalized_class_name(name: str) -> str:
+    return str(name).strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _tile_origins(span: int, tile_size: int, overlap: float) -> list[int]:
+    """Return deterministic crop origins with complete edge coverage."""
+    if tile_size <= 0 or tile_size >= span:
+        return [0]
+    stride = max(1, int(round(tile_size * (1.0 - overlap))))
+    last = span - tile_size
+    origins = list(range(0, last + 1, stride))
+    if origins[-1] != last:
+        origins.append(last)
+    return origins
+
+
+def _class_agnostic_nms(candidates: list[dict], iou: float) -> list[dict]:
+    """Merge duplicate full-frame/tile detections before building the actor mask."""
+    if not candidates:
+        return []
+    boxes = []
+    scores = []
+    for candidate in candidates:
+        x1, y1, x2, y2 = candidate["bbox_xyxy"]
+        boxes.append([float(x1), float(y1), max(0.0, float(x2 - x1)),
+                      max(0.0, float(y2 - y1))])
+        scores.append(float(candidate["confidence"]))
+    indices = cv2.dnn.NMSBoxes(boxes, scores, 0.0, float(iou))
+    if indices is None or len(indices) == 0:
+        return []
+    flattened = np.asarray(indices).reshape(-1)
+    return [candidates[int(index)] for index in flattened]
