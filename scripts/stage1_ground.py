@@ -799,3 +799,413 @@ def _build_background(frames: np.memmap, valid: np.memmap, foreground: np.memmap
 def _write_image(path: Path, image: np.ndarray):
     if not cv2.imwrite(str(path), image):
         raise OSError(f"failed to write image: {path}")
+
+
+def _run_stage1(video, output_dir, options: Stage1Options):
+    options.validate()
+    source = Path(video).resolve()
+    output = Path(output_dir).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"video not found: {source}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    # ExitStack closes Windows memory maps before TemporaryDirectory removes them.
+    # Relying on garbage collection here makes an unrelated processing exception get
+    # replaced by a confusing WinError 32 during cleanup.
+    with tempfile.TemporaryDirectory(prefix=".drone-stage1-", dir=output.parent) as temp_name, \
+            ExitStack() as cleanup:
+        temp_root = Path(temp_name)
+        result_dir = temp_root / "result"
+        result_dir.mkdir()
+        work_source, timing, normalized = _prepare_cfr(source, temp_root, options)
+        info = _video_info(work_source)
+        frame_count, fps = info["frame_count"], info["fps"]
+        width, height = info["width"], info["height"]
+        cuts = _detect_scene_cuts(work_source)
+        indices = _sample_indices(frame_count, options.sample_frames)
+        log("stage1", f"{source.name}: {width}x{height}, {fps:.3f} fps, "
+                      f"{frame_count} frames; sampling {len(indices)}")
+        frame_audit = _frame_geometry_audit(work_source, fps, options)
+        audit_summary = frame_audit["summary"]
+        log("stage1", f"frame audit {audit_summary['estimated_pairs']}/"
+                      f"{audit_summary['frame_pairs']}; max scale step="
+                      f"{audit_summary['max_scale_step_pct']:.3f}%; max center step="
+                      f"{audit_summary['max_center_step_pct']:.3f}%")
+
+        raw_path = temp_root / "registered.dat"
+        valid_path = temp_root / "valid.dat"
+        foreground_path = temp_root / "foreground.dat"
+        frames = np.memmap(raw_path, np.uint8, mode="w+",
+                           shape=(len(indices), height, width, 3))
+        cleanup.callback(frames._mmap.close)
+        valid = np.memmap(valid_path, np.uint8, mode="w+",
+                          shape=(len(indices), height, width))
+        cleanup.callback(valid._mmap.close)
+        foreground = np.memmap(foreground_path, np.uint8, mode="w+",
+                               shape=(len(indices), height, width))
+        cleanup.callback(foreground._mmap.close)
+        foreground[:] = 0
+        _decode_samples(work_source, indices, frames)
+
+        sharpness = [_sharpness(np.asarray(frames[i])) for i in range(len(indices))]
+        normalized_sharpness = np.full(len(indices), np.nan, np.float64)
+        reference_slot = _reference_slot(frames, options.blur_threshold)
+        reference = np.asarray(frames[reference_slot]).copy()
+        reference_features = _features(reference, options)
+        masker = _YoloForegroundMasker(options) if options.foreground_model else None
+        transforms = np.full((len(indices), 3, 3), np.nan, np.float64)
+        accepted = np.zeros(len(indices), bool)
+        registrations = []
+        detected_classes = Counter()
+        reference_detections = []
+        reference_foreground_mask = np.zeros((height, width), np.uint8)
+
+        for slot, frame_number in enumerate(indices):
+            source_frame = np.asarray(frames[slot]).copy()
+            if slot == reference_slot:
+                H, metrics = np.eye(3, dtype=np.float64), _identity_metrics()
+            else:
+                H, metrics = _registration(source_frame, reference, options,
+                                           reference_features)
+            metrics["sample_slot"] = slot
+            metrics["video_frame"] = int(frame_number)
+            metrics["time_s"] = round(float(frame_number / fps), 4)
+            metrics["sharpness"] = round(sharpness[slot], 3)
+            registrations.append(metrics)
+            if H is None:
+                valid[slot] = 0
+                continue
+            transforms[slot] = H
+            accepted[slot] = True
+            actor_mask = np.zeros((height, width), np.uint8)
+            detections = []
+            if masker:
+                actor_mask, detections = masker.mask(source_frame)
+                detected_classes.update(detection["class"] for detection in detections)
+                if slot == reference_slot:
+                    reference_detections = detections
+                    reference_foreground_mask = actor_mask.copy()
+            metrics["foreground_detections"] = len(detections)
+            metrics["foreground_by_class"] = dict(sorted(Counter(
+                detection["class"] for detection in detections).items()))
+            aligned = cv2.warpPerspective(
+                source_frame, H, (width, height), flags=cv2.INTER_LANCZOS4)
+            aligned_valid = cv2.warpPerspective(
+                np.full((height, width), 255, np.uint8), H, (width, height),
+                flags=cv2.INTER_NEAREST)
+            normalized_sharpness[slot] = _sharpness(aligned, aligned_valid)
+            metrics["normalized_sharpness"] = round(normalized_sharpness[slot], 3)
+            metrics["sharpness_retention_pct"] = round(
+                100.0 * normalized_sharpness[slot] / max(sharpness[slot], 1e-9), 3)
+            frames[slot] = aligned
+            valid[slot] = aligned_valid
+            foreground[slot] = cv2.warpPerspective(
+                actor_mask, H, (width, height), flags=cv2.INTER_NEAREST)
+
+        frames.flush()
+        valid.flush()
+        foreground.flush()
+        registered = int(accepted.sum())
+        registered_pct = 100.0 * registered / len(indices)
+        blur_pct = 100.0 * float(np.mean(np.asarray(sharpness) < options.blur_threshold))
+        accepted_normalized_sharpness = normalized_sharpness[accepted]
+        normalized_blur_pct = 100.0 * float(np.mean(
+            accepted_normalized_sharpness < options.blur_threshold))
+        sharpness_retention = np.asarray([
+            float(metrics["sharpness_retention_pct"])
+            for metrics in registrations if metrics.get("accepted")
+        ], np.float64)
+        accepted_metrics = [r for r in registrations if r["accepted"]]
+        max_motion = max(float(r["corner_motion_pct"]) for r in accepted_metrics)
+        max_center_motion = max(float(r["center_motion_pct"]) for r in accepted_metrics)
+        max_rotation = max(abs(float(r["rotation_deg"])) for r in accepted_metrics)
+        max_scale = max(float(r["scale_change_pct"]) for r in accepted_metrics)
+        reprojections = [float(r["median_reprojection_px"]) for r in accepted_metrics
+                         if r["matches"] is not None]
+        rejected_reasons = Counter(r["reason"] for r in registrations if not r["accepted"])
+
+        failures = []
+        if cuts:
+            failures.append(f"detected {len(cuts)} scene cut(s): {cuts}")
+        if audit_summary["estimated_pct"] < options.min_frame_geometry_estimates_pct:
+            failures.append(
+                f"frame geometry measured {audit_summary['estimated_pct']:.1f}% < "
+                f"{options.min_frame_geometry_estimates_pct:.1f}%")
+        if audit_summary["max_scale_step_pct"] > options.max_frame_scale_step_pct:
+            failures.append(
+                f"sudden zoom step {audit_summary['max_scale_step_pct']:.3f}% > "
+                f"{options.max_frame_scale_step_pct:.3f}%")
+        if audit_summary["max_center_step_pct"] > options.max_frame_center_step_pct:
+            failures.append(
+                f"sudden center movement {audit_summary['max_center_step_pct']:.3f}% > "
+                f"{options.max_frame_center_step_pct:.3f}%")
+        if audit_summary["max_rotation_step_deg"] > options.max_frame_rotation_step_deg:
+            failures.append(
+                f"sudden rotation step {audit_summary['max_rotation_step_deg']:.3f} deg > "
+                f"{options.max_frame_rotation_step_deg:.3f} deg")
+        if registered_pct < options.min_registered_pct:
+            failures.append(f"registered {registered_pct:.1f}% < {options.min_registered_pct:.1f}%")
+        if blur_pct > options.max_blur_pct:
+            failures.append(f"blurry samples {blur_pct:.1f}% > {options.max_blur_pct:.1f}%")
+        if normalized_blur_pct > options.max_blur_pct:
+            failures.append(
+                f"blurry normalized samples {normalized_blur_pct:.1f}% > "
+                f"{options.max_blur_pct:.1f}%")
+
+        final_names = {
+            "ground": "ground.png",
+            "valid_mask": "valid_mask.png",
+            "temporal_variation": "temporal_variation.png",
+            "foreground_frequency": "foreground_frequency.png",
+            "detection_preview": "detection_preview.png",
+            "reference_foreground_mask": "reference_foreground_mask.png",
+            "semantic_exclusion": "semantic_exclusion_mask.png",
+            "inpaint_mask": "inpaint_mask.png",
+            "sample_transforms": "sample_transforms_to_reference.npy",
+            "frame_transforms": "frame_transforms_to_reference.npy",
+            "registration": "registration.json",
+            "frame_geometry": "frame_geometry.json",
+            "report": "report.json",
+            "video_cfr": f"video_cfr{work_source.suffix.lower() or '.mp4'}",
+        }
+        # Paths inside the artifact manifest are relative to the directory containing
+        # report.json, so a completed Stage 1 bundle can be moved as a unit.
+        output_paths = dict(final_names)
+        np.save(result_dir / final_names["sample_transforms"], transforms)
+        registration_path = result_dir / final_names["registration"]
+        registration_path.write_text(json.dumps(registrations, indent=2), encoding="utf-8")
+        (result_dir / final_names["frame_geometry"]).write_text(
+            json.dumps(frame_audit, indent=2), encoding="utf-8")
+        shutil.copy2(work_source, result_dir / final_names["video_cfr"])
+        if masker:
+            _write_image(result_dir / final_names["detection_preview"],
+                         _detection_preview(reference, reference_detections))
+            _write_image(result_dir / final_names["reference_foreground_mask"],
+                         reference_foreground_mask)
+
+        coverage_pct = 0.0
+        inpainted_pct = 0.0
+        unresolved_pct = 0.0
+        foreground_observation_pct = 0.0
+        semantic_exclusion_pct = 0.0
+        semantic_consensus_frames = 0
+        residual_detections = []
+        residual_detections_before_repair = []
+        residual_repair_pct = 0.0
+        minimum_observations = 0
+        if registered >= 3:
+            frame_transforms = _interpolate_frame_transforms(
+                frame_count, indices, transforms, accepted)
+            np.save(result_dir / final_names["frame_transforms"], frame_transforms)
+            (ground, heat, holes, frequency, semantic_exclusion,
+             minimum_observations, semantic_consensus_frames) = _build_background(
+                frames, valid, foreground, accepted, options)
+            repaired, inpaint_mask, unresolved = _inpaint_small_holes(
+                ground[:, :, :3], holes, options)
+            ground[:, :, :3] = repaired
+            ground[unresolved, 3] = 0
+            foreground_observation_pct = 100.0 * float(np.mean(frequency))
+            semantic_exclusion_pct = 100.0 * float(np.mean(semantic_exclusion))
+            if masker:
+                residual_mask, residual_detections = masker.mask(
+                    ground[:, :, :3], options.residual_foreground_conf)
+                residual_detections_before_repair = list(residual_detections)
+                residual_repair_mask = np.zeros_like(residual_mask)
+                for _ in range(options.residual_repair_passes):
+                    if not residual_detections:
+                        break
+                    repaired, eligible, residual_unresolved = _inpaint_small_holes(
+                        ground[:, :, :3], residual_mask > 0, options)
+                    if not np.any(eligible):
+                        unresolved |= residual_unresolved
+                        break
+                    ground[:, :, :3] = repaired
+                    residual_repair_mask = np.maximum(residual_repair_mask, eligible)
+                    inpaint_mask = np.maximum(inpaint_mask, eligible)
+                    unresolved |= residual_unresolved
+                    ground[unresolved, 3] = 0
+                    residual_mask, residual_detections = masker.mask(
+                        ground[:, :, :3], options.residual_foreground_conf)
+                residual_repair_pct = 100.0 * float(
+                    np.mean(residual_repair_mask > 0))
+
+            coverage = ground[:, :, 3] > 0
+            coverage_pct = 100.0 * float(np.mean(coverage))
+            inpainted_pct = 100.0 * float(np.mean(inpaint_mask > 0))
+            unresolved_pct = 100.0 * float(np.mean(unresolved))
+
+            _write_image(result_dir / final_names["ground"], ground)
+            _write_image(result_dir / final_names["valid_mask"], ground[:, :, 3])
+            valid_heat = heat[coverage]
+            heat_limit = max(1.0, float(np.percentile(valid_heat, 99))) if valid_heat.size else 1.0
+            heat_u8 = np.clip(255.0 * heat / heat_limit, 0, 255).astype(np.uint8)
+            _write_image(result_dir / final_names["temporal_variation"], heat_u8)
+            _write_image(result_dir / final_names["foreground_frequency"],
+                         np.clip(frequency * 255.0, 0, 255).astype(np.uint8))
+            _write_image(result_dir / final_names["semantic_exclusion"],
+                         semantic_exclusion.astype(np.uint8) * 255)
+            _write_image(result_dir / final_names["inpaint_mask"], inpaint_mask)
+
+            if coverage_pct < options.min_output_coverage_pct:
+                failures.append(f"output coverage {coverage_pct:.1f}% < "
+                                f"{options.min_output_coverage_pct:.1f}%")
+            if inpainted_pct > options.max_inpainted_pct:
+                failures.append(f"inpainted area {inpainted_pct:.2f}% > "
+                                f"{options.max_inpainted_pct:.2f}%")
+            if unresolved_pct > options.max_unresolved_hole_pct:
+                failures.append(f"unresolved foreground holes {unresolved_pct:.3f}% > "
+                                f"{options.max_unresolved_hole_pct:.3f}%")
+            if (masker and len(residual_detections) >
+                    options.max_residual_foreground_detections):
+                failures.append(f"static plate still contains {len(residual_detections)} "
+                                "detectable foreground object(s)")
+        else:
+            np.save(result_dir / final_names["frame_transforms"],
+                    np.full((frame_count, 3, 3), np.nan, np.float64))
+            failures.append(f"only {registered} sampled frames registered; need at least 3")
+
+        published_outputs = {
+            key: path for key, path in output_paths.items()
+            if key == "report" or (result_dir / final_names[key]).exists()
+        }
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": 1,
+            "contract": INPUT_CONTRACT,
+            "input": {
+                "path": str(source),
+                "sha256": _file_sha256(source),
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "frame_count": frame_count,
+                "duration_s": round(frame_count / fps, 3),
+                "variable_frame_rate_detected": timing["variable_frame_rate"],
+                "normalized_to_cfr": normalized,
+                "timestamp_jitter_p99_pct": round(timing["timestamp_jitter_p99_pct"], 4),
+                "scene_cuts_s": cuts,
+            },
+            "reference": {
+                "sample_slot": reference_slot,
+                "video_frame": int(indices[reference_slot]),
+                "time_s": round(float(indices[reference_slot] / fps), 4),
+            },
+            "detector": masker.metadata if masker else {"enabled": False},
+            "quality": {
+                "sampled_frames": len(indices),
+                "registered_frames": registered,
+                "registered_pct": round(registered_pct, 3),
+                "output_coverage_pct": round(coverage_pct, 3),
+                "blur_pct": round(blur_pct, 3),
+                "normalized_blur_pct": round(normalized_blur_pct, 3),
+                "normalized_sharpness_min": round(
+                    float(np.min(accepted_normalized_sharpness)), 3),
+                "normalized_sharpness_median": round(
+                    float(np.median(accepted_normalized_sharpness)), 3),
+                "sharpness_retention_min_pct": round(
+                    float(np.min(sharpness_retention)), 3),
+                "sharpness_retention_median_pct": round(
+                    float(np.median(sharpness_retention)), 3),
+                "normalization_interpolation": "lanczos4",
+                "frame_geometry": audit_summary,
+                "max_corner_motion_pct": round(max_motion, 3),
+                "max_center_motion_pct": round(max_center_motion, 3),
+                "max_rotation_deg": round(max_rotation, 4),
+                "max_scale_change_pct": round(max_scale, 4),
+                "median_registration_error_px": (
+                    round(float(np.median(reprojections)), 4) if reprojections else None),
+                "minimum_observations_per_pixel": minimum_observations,
+                "rejected_frames_by_reason": dict(sorted(rejected_reasons.items())),
+                "detected_foreground_by_class": dict(sorted(detected_classes.items())),
+                "foreground_masked_observations_pct": round(foreground_observation_pct, 4),
+                "semantic_exclusion_area_pct": round(semantic_exclusion_pct, 4),
+                "semantic_consensus_frames": semantic_consensus_frames,
+                "inpainted_area_pct": round(inpainted_pct, 4),
+                "unresolved_foreground_hole_pct": round(unresolved_pct, 4),
+                "residual_detections_before_repair": residual_detections_before_repair,
+                "residual_repair_area_pct": round(residual_repair_pct, 4),
+                "residual_foreground_detections": residual_detections,
+            },
+            "assumptions": ASSUMPTIONS,
+            "limitations": LIMITATIONS,
+            "coordinates": {
+                "space": "reference_image_pixels",
+                "origin": "top_left",
+                "x_axis": "right",
+                "y_axis": "down",
+                "transform_direction": "source_frame_pixels_to_reference_image_pixels",
+                "metric_scale": None,
+            },
+            "options": asdict(options),
+            "pass": not failures,
+            "failure_reasons": failures,
+            "outputs": published_outputs,
+        }
+        (result_dir / final_names["report"]).write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        (result_dir / ".stage1-output").write_text(SCHEMA_VERSION, encoding="utf-8")
+        log("stage1", f"registered {registered}/{len(indices)}; coverage={coverage_pct:.1f}%; "
+                      f"blur={blur_pct:.1f}%; max motion={max_motion:.1f}%")
+        frames.flush(); valid.flush(); foreground.flush()
+        _publish_directory(result_dir, output)
+        del frames, valid, foreground
+        return report
+
+
+def _publish_failure_report(video, output_dir, options: Stage1Options,
+                            error: Exception):
+    """Atomically publish a minimal report when processing cannot reach quality gates."""
+    source = Path(video).resolve()
+    output = Path(output_dir).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    input_details = {"path": str(source)}
+    if source.is_file():
+        input_details["sha256"] = _file_sha256(source)
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "stage": 1,
+        "contract": INPUT_CONTRACT,
+        "input": input_details,
+        "assumptions": ASSUMPTIONS,
+        "limitations": LIMITATIONS,
+        "coordinates": {
+            "space": "reference_image_pixels",
+            "origin": "top_left",
+            "x_axis": "right",
+            "y_axis": "down",
+            "transform_direction": "source_frame_pixels_to_reference_image_pixels",
+            "metric_scale": None,
+        },
+        "options": asdict(options),
+        "pass": False,
+        "failure_reasons": [f"{type(error).__name__}: {error}"],
+        "error": {"type": type(error).__name__, "message": str(error)},
+        "outputs": {"report": "report.json"},
+    }
+    with tempfile.TemporaryDirectory(prefix=".drone-stage1-failure-",
+                                     dir=output.parent) as temp_name:
+        result_dir = Path(temp_name) / "result"
+        result_dir.mkdir()
+        (result_dir / "report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        (result_dir / ".stage1-output").write_text(SCHEMA_VERSION, encoding="utf-8")
+        _publish_directory(result_dir, output)
+    return report
+
+
+def run_stage1(video, output_dir, options: Stage1Options | None = None):
+    """Run Stage 1 and guarantee a report for every catchable processing failure."""
+    resolved_options = options or Stage1Options()
+    source = Path(video).resolve()
+    output = Path(output_dir).resolve()
+    # Unsafe target errors intentionally do not publish into that target.
+    _validate_output_target(source, output)
+    try:
+        return _run_stage1(video, output_dir, resolved_options)
+    except Exception as error:
+        try:
+            _publish_failure_report(video, output_dir, resolved_options, error)
+        except Exception as report_error:
+            if hasattr(error, "add_note"):
+                error.add_note(f"Could not publish Stage 1 failure report: {report_error}")
+        raise
