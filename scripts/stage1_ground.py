@@ -750,3 +750,52 @@ def _frame_geometry_audit(path: Path, fps: float, options: Stage1Options):
         summary["max_rotation_step_deg"] <= options.max_frame_rotation_step_deg
     )
     return {"summary": summary, "pairs": pairs}
+
+
+def _build_background(frames: np.memmap, valid: np.memmap, foreground: np.memmap,
+                      accepted: np.ndarray, options: Stage1Options):
+    height, width = frames.shape[1:3]
+    ground = np.zeros((height, width, 4), np.uint8)
+    heat = np.zeros((height, width), np.float32)
+    holes = np.zeros((height, width), bool)
+    foreground_frequency = np.zeros((height, width), np.float32)
+    accepted_slots = np.flatnonzero(accepted)
+    minimum = max(3, int(math.ceil(len(accepted_slots) * options.min_observation_fraction)))
+    semantic_exclusion, semantic_consensus_frames = _semantic_exclusion(
+        foreground, accepted, options)
+
+    for y0 in range(0, height, options.tile):
+        y1 = min(height, y0 + options.tile)
+        for x0 in range(0, width, options.tile):
+            x1 = min(width, x0 + options.tile)
+            pixels = np.asarray(frames[accepted_slots, y0:y1, x0:x1], dtype=np.float32)
+            geometric = np.asarray(valid[accepted_slots, y0:y1, x0:x1], dtype=bool)
+            actors = np.asarray(foreground[accepted_slots, y0:y1, x0:x1], dtype=bool)
+            # A pixel occupied in several sampled frames is not necessarily a static
+            # actor: dense traffic repeatedly crosses the same road pixels. Keep the
+            # consensus map as review evidence, but reconstruct from every genuinely
+            # actor-free observation. A persistent actor naturally leaves too few
+            # observations, while a missed one is caught by the residual detector.
+            observed = geometric & ~actors
+            masked = np.where(observed[..., None], pixels, np.nan)
+            with warnings.catch_warnings(), np.errstate(all="ignore"):
+                warnings.filterwarnings("ignore", message="All-NaN slice encountered",
+                                        category=RuntimeWarning)
+                median = np.nanmedian(masked, axis=0)
+                deviation = np.nanmedian(np.abs(masked - median[None, ...]), axis=(0, 3))
+            enough_geometry = geometric.sum(axis=0) >= minimum
+            enough_background = observed.sum(axis=0) >= minimum
+            median = np.nan_to_num(median, nan=0.0)
+            ground[y0:y1, x0:x1, :3] = np.clip(median, 0, 255).astype(np.uint8)
+            ground[y0:y1, x0:x1, 3] = np.where(enough_geometry, 255, 0).astype(np.uint8)
+            heat[y0:y1, x0:x1] = np.nan_to_num(deviation, nan=0.0)
+            holes[y0:y1, x0:x1] = enough_geometry & ~enough_background
+            foreground_frequency[y0:y1, x0:x1] = actors.mean(axis=0)
+
+    return (ground, heat, holes, foreground_frequency, semantic_exclusion,
+            minimum, semantic_consensus_frames)
+
+
+def _write_image(path: Path, image: np.ndarray):
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"failed to write image: {path}")
