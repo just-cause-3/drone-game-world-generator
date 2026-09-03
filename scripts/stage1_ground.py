@@ -676,3 +676,77 @@ def _identity_metrics():
         "scale_factor": 1.0,
         "scale_change_pct": 0.0,
     }
+
+
+def _frame_geometry_audit(path: Path, fps: float, options: Stage1Options):
+    """Measure every consecutive frame so jumps cannot hide between samples."""
+    audit_options = replace(
+        options,
+        orb_features=options.frame_audit_orb_features,
+        min_matches=min(options.min_matches, 25),
+        min_inliers=min(options.min_inliers, 18),
+        min_frame_overlap_pct=0.0,
+        max_center_motion_pct=100.0,
+        max_corner_motion_pct=100.0,
+        max_rotation_deg=180.0,
+        max_scale_change_pct=100.0,
+    )
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"could not open video for frame geometry audit: {path}")
+    ok, previous = cap.read()
+    if not ok:
+        cap.release()
+        raise RuntimeError("could not decode first frame for geometry audit")
+    previous_features = _features(previous, audit_options)
+    pairs = []
+    frame_number = 1
+    try:
+        while True:
+            ok, current = cap.read()
+            if not ok:
+                break
+            _, metrics = _registration(
+                current, previous, audit_options, previous_features)
+            metrics["from_frame"] = frame_number - 1
+            metrics["to_frame"] = frame_number
+            metrics["time_s"] = round(frame_number / fps, 6)
+            pairs.append(metrics)
+            previous = current
+            previous_features = _features(previous, audit_options)
+            frame_number += 1
+    finally:
+        cap.release()
+
+    trusted = [metrics for metrics in pairs if metrics.get("accepted")]
+    estimated_pct = 100.0 * len(trusted) / len(pairs) if pairs else 0.0
+
+    def values(name, absolute=False):
+        result = [float(metrics[name]) for metrics in trusted if name in metrics]
+        return [abs(value) for value in result] if absolute else result
+
+    scale_steps = values("scale_change_pct")
+    center_steps = values("center_motion_pct")
+    rotation_steps = values("rotation_deg", absolute=True)
+    summary = {
+        "frame_pairs": len(pairs),
+        "estimated_pairs": len(trusted),
+        "estimated_pct": round(estimated_pct, 4),
+        "max_scale_step_pct": round(max(scale_steps, default=0.0), 4),
+        "p95_scale_step_pct": round(float(np.percentile(scale_steps, 95)), 4)
+        if scale_steps else None,
+        "max_center_step_pct": round(max(center_steps, default=0.0), 4),
+        "p95_center_step_pct": round(float(np.percentile(center_steps, 95)), 4)
+        if center_steps else None,
+        "max_rotation_step_deg": round(max(rotation_steps, default=0.0), 4),
+        "failure_reasons": dict(sorted(Counter(
+            metrics.get("reason") or "unknown" for metrics in pairs
+            if not metrics.get("accepted")).items())),
+    }
+    summary["smooth"] = bool(
+        estimated_pct >= options.min_frame_geometry_estimates_pct and
+        summary["max_scale_step_pct"] <= options.max_frame_scale_step_pct and
+        summary["max_center_step_pct"] <= options.max_frame_center_step_pct and
+        summary["max_rotation_step_deg"] <= options.max_frame_rotation_step_deg
+    )
+    return {"summary": summary, "pairs": pairs}
