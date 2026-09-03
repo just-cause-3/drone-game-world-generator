@@ -574,3 +574,105 @@ def _reference_slot(frames: np.memmap, blur_threshold: float) -> int:
     radius = max(1, count // 10)
     candidates = range(max(0, center - radius), min(count, center + radius + 1))
     return max(candidates, key=lambda i: _sharpness(np.asarray(frames[i])))
+
+
+def _features(frame: np.ndarray, options: Stage1Options):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.ORB_create(options.orb_features).detectAndCompute(gray, None)
+
+
+def _registration(frame: np.ndarray, reference: np.ndarray, options: Stage1Options,
+                  reference_features=None):
+    """Estimate a constrained similarity transform from frame -> reference."""
+    kp, desc = _features(frame, options)
+    ref_kp, ref_desc = reference_features or _features(reference, options)
+    if desc is None or ref_desc is None:
+        return None, {"accepted": False, "reason": "insufficient_features"}
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    pairs = matcher.knnMatch(desc, ref_desc, k=2)
+    good = [first for pair in pairs if len(pair) == 2
+            for first, second in [pair]
+            if first.distance < options.ratio_test * second.distance]
+    if len(good) < options.min_matches:
+        return None, {"accepted": False, "reason": "insufficient_matches",
+                      "matches": len(good)}
+
+    source = np.float32([kp[m.queryIdx].pt for m in good])
+    target = np.float32([ref_kp[m.trainIdx].pt for m in good])
+    affine, mask = cv2.estimateAffinePartial2D(
+        source, target, method=cv2.RANSAC,
+        ransacReprojThreshold=options.ransac_px,
+        maxIters=5000, confidence=0.999, refineIters=20)
+    if affine is None or mask is None:
+        return None, {"accepted": False, "reason": "transform_failed",
+                      "matches": len(good)}
+
+    inlier_mask = mask.ravel().astype(bool)
+    inliers = int(inlier_mask.sum())
+    ratio = inliers / len(good)
+    H = np.vstack([affine, [0.0, 0.0, 1.0]]).astype(np.float64)
+    projected = cv2.transform(source[inlier_mask, None, :], affine)[:, 0]
+    reprojection = float(np.median(np.linalg.norm(projected - target[inlier_mask], axis=1)))
+
+    height, width = frame.shape[:2]
+    corners = np.float32([[[0, 0]], [[width - 1, 0]],
+                          [[width - 1, height - 1]], [[0, height - 1]]])
+    moved = cv2.perspectiveTransform(corners, H)
+    diagonal = math.hypot(width, height)
+    corner_motion_pct = 100.0 * float(
+        np.max(np.linalg.norm(moved[:, 0] - corners[:, 0], axis=1))) / diagonal
+    center = np.float32([[[0.5 * (width - 1), 0.5 * (height - 1)]]])
+    moved_center = cv2.perspectiveTransform(center, H)
+    center_motion_pct = 100.0 * float(
+        np.linalg.norm(moved_center[0, 0] - center[0, 0])) / diagonal
+    valid = cv2.warpPerspective(np.full((height, width), 255, np.uint8), H,
+                                (width, height), flags=cv2.INTER_NEAREST)
+    overlap_pct = 100.0 * float(np.mean(valid > 0))
+    scale = float(math.hypot(affine[0, 0], affine[1, 0]))
+    rotation_deg = float(math.degrees(math.atan2(affine[1, 0], affine[0, 0])))
+    scale_change_pct = 100.0 * abs(scale - 1.0)
+
+    checks = [
+        (inliers >= options.min_inliers, "too_few_inliers"),
+        (ratio >= options.min_inlier_ratio, "low_inlier_ratio"),
+        (reprojection <= options.max_reprojection_px, "high_reprojection_error"),
+        (abs(rotation_deg) <= options.max_rotation_deg, "camera_rotated_too_far"),
+        (center_motion_pct <= options.max_center_motion_pct, "camera_moved_too_far"),
+        (scale_change_pct <= options.max_scale_change_pct, "camera_zoomed_too_far"),
+        (corner_motion_pct <= options.max_corner_motion_pct, "frame_transform_too_large"),
+        (overlap_pct >= options.min_frame_overlap_pct, "low_frame_overlap"),
+    ]
+    failure = next((reason for ok, reason in checks if not ok), None)
+    metrics = {
+        "accepted": failure is None,
+        "reason": failure,
+        "matches": len(good),
+        "inliers": inliers,
+        "inlier_ratio": round(ratio, 4),
+        "median_reprojection_px": round(reprojection, 4),
+        "frame_overlap_pct": round(overlap_pct, 3),
+        "center_motion_pct": round(center_motion_pct, 3),
+        "corner_motion_pct": round(corner_motion_pct, 3),
+        "rotation_deg": round(rotation_deg, 4),
+        "scale_factor": round(scale, 7),
+        "scale_change_pct": round(scale_change_pct, 4),
+    }
+    return (H if failure is None else None), metrics
+
+
+def _identity_metrics():
+    return {
+        "accepted": True,
+        "reason": None,
+        "matches": None,
+        "inliers": None,
+        "inlier_ratio": 1.0,
+        "median_reprojection_px": 0.0,
+        "frame_overlap_pct": 100.0,
+        "center_motion_pct": 0.0,
+        "corner_motion_pct": 0.0,
+        "rotation_deg": 0.0,
+        "scale_factor": 1.0,
+        "scale_change_pct": 0.0,
+    }
