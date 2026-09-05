@@ -61,3 +61,41 @@ def find_unity_editor(project_dir, override=None) -> Path:
     raise FileNotFoundError(
         f"Unity editor {version} is not installed at the expected Hub location; "
         "pass --unity-editor explicitly")
+
+
+def unity_project_is_open(project_dir) -> bool:
+    project = validate_unity_project(project_dir)
+    return (project / "Temp" / "UnityLockfile").exists()
+
+
+def import_stage1_bundle(project_dir, bundle_dir, unity_editor=None,
+                         runner=subprocess.run) -> Path:
+    """Import a passing bundle through Unity batch mode and return its log path."""
+    project = validate_unity_project(project_dir)
+    bundle = Path(bundle_dir).resolve()
+    report = bundle / "report.json"
+    if not report.is_file():
+        raise FileNotFoundError(f"Stage 1 report not found: {report}")
+    if unity_project_is_open(project):
+        raise RuntimeError(
+            "Unity project is already open. Close it before using the command-line "
+            "pipeline, or run 'Drone World > Run Stage 1 Pipeline' inside Unity.")
+    editor = find_unity_editor(project, unity_editor)
+    log_path = bundle / "unity_import.log"
+    command = [
+        str(editor), "-batchmode", "-nographics", "-quit",
+        "-projectPath", str(project),
+        "-executeMethod", UNITY_IMPORT_METHOD,
+        "-stage1Bundle", str(bundle),
+        "-logFile", str(log_path),
+    ]
+    completed = runner(command, check=False)
+    if completed.returncode != 0:
+        tail = ""
+        if log_path.is_file():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-30:])
+        raise RuntimeError(
+            f"Unity rejected Stage 1 or failed to build the scene "
+            f"(exit {completed.returncode}).\n{tail}")
+    return log_path
