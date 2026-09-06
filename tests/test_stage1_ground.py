@@ -58,6 +58,68 @@ class Stage1GroundTests(unittest.TestCase):
             Stage1Options(foreground_model=None,
                           foreground_tile_overlap=0.95).validate()
 
+    def test_frame_geometry_audit_flags_a_sudden_zoom_jump(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            video = Path(temp_name) / "zoom_jump.avi"
+            world = _synthetic_world()
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"),
+                                     15.0, (320, 240))
+            self.assertTrue(writer.isOpened())
+            for index in range(20):
+                if index < 10:
+                    frame = world
+                else:
+                    transform = cv2.getRotationMatrix2D((160, 120), 0.0, 0.90)
+                    frame = cv2.warpAffine(world, transform, (320, 240),
+                                           borderMode=cv2.BORDER_REFLECT)
+                writer.write(frame)
+            writer.release()
+            options = Stage1Options(foreground_model=None,
+                                    frame_audit_orb_features=1500)
+
+            audit = _frame_geometry_audit(video, 15.0, options)
+
+            self.assertFalse(audit["summary"]["smooth"])
+            self.assertGreater(audit["summary"]["max_scale_step_pct"],
+                               options.max_frame_scale_step_pct)
+
+    def test_similarity_registration_recovers_small_hover_drift(self):
+        reference = _synthetic_world()
+        transform = cv2.getRotationMatrix2D((160, 120), 0.8, 1.01)
+        transform[:, 2] += (5, -3)
+        frame = cv2.warpAffine(reference, transform, (320, 240))
+        options = Stage1Options(min_matches=15, min_inliers=12,
+                                max_rotation_deg=3, max_scale_change_pct=5,
+                                foreground_model=None)
+        H, metrics = _registration(frame, reference, options)
+        self.assertIsNotNone(H, metrics)
+        self.assertTrue(metrics["accepted"], metrics)
+        aligned = cv2.warpPerspective(frame, H, (320, 240))
+        self.assertLess(float(cv2.absdiff(aligned, reference).mean()), 12.0)
+
+    def test_rejects_large_zoom_outside_stage_contract(self):
+        reference = _synthetic_world()
+        transform = cv2.getRotationMatrix2D((160, 120), 0.0, 1.30)
+        frame = cv2.warpAffine(reference, transform, (320, 240))
+        options = Stage1Options(min_matches=15, min_inliers=12,
+                                max_scale_change_pct=15, foreground_model=None)
+        H, metrics = _registration(frame, reference, options)
+        self.assertIsNone(H)
+        self.assertEqual(metrics["reason"], "camera_zoomed_too_far")
+
+    def test_accepts_centered_zoom_within_relaxed_stage_contract(self):
+        reference = _synthetic_world()
+        transform = cv2.getRotationMatrix2D((160, 120), 0.0, 0.86)
+        frame = cv2.warpAffine(reference, transform, (320, 240),
+                               borderMode=cv2.BORDER_REFLECT)
+        options = Stage1Options(min_matches=15, min_inliers=12,
+                                foreground_model=None)
+        H, metrics = _registration(frame, reference, options)
+        self.assertIsNotNone(H, metrics)
+        self.assertTrue(metrics["accepted"], metrics)
+        self.assertLessEqual(metrics["scale_change_pct"], 18.0)
+        self.assertLessEqual(metrics["center_motion_pct"], 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
