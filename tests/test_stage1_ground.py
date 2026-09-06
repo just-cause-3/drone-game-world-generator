@@ -120,6 +120,97 @@ class Stage1GroundTests(unittest.TestCase):
         self.assertLessEqual(metrics["scale_change_pct"], 18.0)
         self.assertLessEqual(metrics["center_motion_pct"], 3.0)
 
+    def test_end_to_end_builds_clean_registered_background(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            video = temp / "hover.avi"
+            output = temp / "stage1"
+            output.mkdir()
+            (output / ".stage1-output").write_text(
+                "stage1-ground-v1", encoding="utf-8")
+            (output / "stale.txt").write_text("old run", encoding="utf-8")
+            world = _synthetic_world()
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"),
+                                     15.0, (320, 240))
+            self.assertTrue(writer.isOpened())
+            for index in range(30):
+                dx = int(round(4 * np.sin(index / 5)))
+                dy = int(round(3 * np.cos(index / 6)))
+                frame = cv2.warpAffine(world, np.float32([[1, 0, dx], [0, 1, dy]]),
+                                       (320, 240), borderMode=cv2.BORDER_REFLECT)
+                x = 10 + index * 9
+                cv2.rectangle(frame, (x, 130), (min(x + 18, 319), 148), (0, 0, 255), -1)
+                writer.write(frame)
+            writer.release()
+
+            options = Stage1Options(sample_frames=21, tile=64, min_matches=15,
+                                    min_inliers=12, min_output_coverage_pct=85,
+                                    foreground_model=None)
+            report = run_stage1(video, output, options)
+            self.assertTrue(report["pass"], report["failure_reasons"])
+            self.assertGreaterEqual(report["quality"]["registered_pct"], 90)
+            self.assertEqual(report["quality"]["frame_geometry"]["estimated_pct"], 100.0)
+            self.assertIn("normalized_sharpness_median", report["quality"])
+            self.assertEqual(report["quality"]["normalization_interpolation"], "lanczos4")
+            self.assertEqual(report["schema_version"], "stage1-ground-v1")
+            self.assertFalse((output / "stale.txt").exists())
+            transforms = np.load(output / "frame_transforms_to_reference.npy")
+            self.assertEqual(transforms.shape, (30, 3, 3))
+            ground = cv2.imread(str(output / "ground.png"), cv2.IMREAD_UNCHANGED)
+            self.assertEqual(ground.shape, (240, 320, 4))
+            self.assertGreater(float(np.mean(ground[:, :, 3] == 255)), 0.85)
+            # The red foreground rectangle crosses most of the road but is visible at
+            # each location in fewer than half the samples, so the median must remove it.
+            red_foreground = ((ground[:, :, 2].astype(int) - ground[:, :, 1]) > 70) & (
+                (ground[:, :, 2].astype(int) - ground[:, :, 0]) > 70)
+            self.assertLess(int(red_foreground.sum()), 25)
+
+    def test_registration_failure_still_publishes_report(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            video = temp / "blank.avi"
+            output = temp / "stage1"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"),
+                                     15.0, (160, 120))
+            self.assertTrue(writer.isOpened())
+            for _ in range(15):
+                writer.write(np.full((120, 160, 3), 80, np.uint8))
+            writer.release()
+            options = Stage1Options(sample_frames=9, tile=64, foreground_model=None)
+            report = run_stage1(video, output, options)
+            self.assertFalse(report["pass"])
+            self.assertTrue((output / "report.json").exists())
+            self.assertNotIn("ground", report["outputs"])
+
+    def test_inpainting_is_limited_to_small_holes(self):
+        image = np.full((100, 100, 3), 100, np.uint8)
+        holes = np.zeros((100, 100), bool)
+        holes[45:55, 45:55] = True
+        options = Stage1Options(foreground_model=None, max_inpaint_component_pct=2.0)
+        repaired, mask, unresolved = _inpaint_small_holes(image, holes, options)
+        self.assertEqual(int(np.count_nonzero(mask)), 100)
+        self.assertFalse(np.any(unresolved))
+        self.assertEqual(repaired.shape, image.shape)
+
+    def test_unexpected_processing_error_publishes_atomic_failure_report(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            missing_video = temp / "missing.mp4"
+            output = temp / "stage1"
+            output.mkdir()
+            (output / ".stage1-output").write_text(
+                "stage1-ground-v1", encoding="utf-8")
+            (output / "stale.txt").write_text("old run", encoding="utf-8")
+
+            with self.assertRaises(FileNotFoundError):
+                run_stage1(missing_video, output, Stage1Options(foreground_model=None))
+
+            self.assertFalse((output / "stale.txt").exists())
+            report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+            self.assertFalse(report["pass"])
+            self.assertEqual(report["error"]["type"], "FileNotFoundError")
+            self.assertEqual(set(report["outputs"]), {"report"})
+
 
 if __name__ == "__main__":
     unittest.main()
