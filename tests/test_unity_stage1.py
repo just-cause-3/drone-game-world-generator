@@ -61,6 +61,27 @@ class UnityStage1Tests(unittest.TestCase):
             self.assertEqual(log_path, bundle.resolve() / "unity_import.log")
             self.assertFalse(runner.call_args.kwargs["check"])
 
+    @patch("pipeline.import_stage1_bundle")
+    @patch("pipeline.run_stage1")
+    def test_pipeline_does_not_touch_unity_when_quality_gate_fails(
+            self, run_stage1_mock, unity_import_mock):
+        run_stage1_mock.return_value = {
+            "pass": False,
+            "failure_reasons": ["camera zoom changed"],
+        }
+        result = pipeline.main(["stage1", "input.mp4"])
+        self.assertEqual(result, 2)
+        unity_import_mock.assert_not_called()
+
+    @patch("pipeline.import_stage1_bundle")
+    @patch("pipeline.run_stage1")
+    def test_pipeline_publishes_passing_bundle(self, run_stage1_mock, unity_import_mock):
+        run_stage1_mock.return_value = {"pass": True, "failure_reasons": []}
+        unity_import_mock.return_value = Path("stage1_out/unity_import.log")
+        result = pipeline.main(["stage1", "input.mp4"])
+        self.assertEqual(result, 0)
+        unity_import_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
