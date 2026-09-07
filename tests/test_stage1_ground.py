@@ -211,6 +211,56 @@ class Stage1GroundTests(unittest.TestCase):
             self.assertEqual(report["error"]["type"], "FileNotFoundError")
             self.assertEqual(set(report["outputs"]), {"report"})
 
+    def test_refuses_to_replace_unrelated_nonempty_directory(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            video = temp / "input.mp4"
+            video.write_bytes(b"not decoded because target validation runs first")
+            unrelated = temp / "important"
+            unrelated.mkdir()
+            valuable = unrelated / "keep.txt"
+            valuable.write_text("do not replace", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "refusing to replace"):
+                run_stage1(video, unrelated, Stage1Options(foreground_model=None))
+
+            self.assertEqual(valuable.read_text(encoding="utf-8"), "do not replace")
+
+    def test_repeated_semantic_detection_becomes_exclusion_zone(self):
+        foreground = np.zeros((10, 20, 30), np.uint8)
+        foreground[1, 5:10, 8:14] = 255
+        foreground[4, 5:10, 8:14] = 255
+        accepted = np.ones(10, bool)
+        options = Stage1Options(foreground_model=None,
+                                semantic_consensus_fraction=0.15,
+                                min_semantic_consensus_frames=2)
+
+        exclusion, required = _semantic_exclusion(foreground, accepted, options)
+
+        self.assertEqual(required, 2)
+        self.assertTrue(np.all(exclusion[5:10, 8:14]))
+        self.assertFalse(np.any(exclusion[:5]))
+
+    def test_repeated_traffic_does_not_erase_available_clean_ground(self):
+        frames = np.full((10, 12, 12, 3), 90, np.uint8)
+        valid = np.full((10, 12, 12), 255, np.uint8)
+        foreground = np.zeros((10, 12, 12), np.uint8)
+        foreground[:2, 3:9, 3:9] = 255
+        frames[:2, 3:9, 3:9] = 220
+        accepted = np.ones(10, bool)
+        options = Stage1Options(foreground_model=None, tile=32,
+                                semantic_consensus_fraction=0.15,
+                                min_semantic_consensus_frames=2)
+
+        ground, _, holes, _, semantic, minimum, required = _build_background(
+            frames, valid, foreground, accepted, options)
+
+        self.assertEqual(minimum, 3)
+        self.assertEqual(required, 2)
+        self.assertTrue(np.all(semantic[3:9, 3:9]))
+        self.assertFalse(np.any(holes))
+        self.assertTrue(np.all(ground[3:9, 3:9, :3] == 90))
+
 
 if __name__ == "__main__":
     unittest.main()
