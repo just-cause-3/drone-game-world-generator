@@ -1,5 +1,75 @@
 # Drone Video → Unity Recreation Pipeline
 
+> **Staged rebuild in progress:** the older end-to-end pipeline below is retained as
+> reference. New work starts with a deliberately narrower, testable contract: a
+> stationary or gently drifting, top-down drone video with bounded zoom must produce a validated
+> static ground image. Unity integration will be rebuilt only after this stage is solid.
+
+## New Stage 1 — top-down video to validated ground
+
+Install the pinned aerial detector once, then run:
+
+```powershell
+.venv\Scripts\python.exe setup_drone_model.py
+.venv\Scripts\python.exe stage1.py path/to/stationary_top_down.mp4 --output stage1_out
+```
+
+Stage 1 uses a checksum-pinned YOLO26x model fine-tuned on VisDrone aerial imagery. It
+runs both the complete frame and overlapping 640 px crops at a 1280 px inference size,
+with test-time augmentation, then performs global duplicate suppression. This favors
+small top-down actor recall over speed. The current foreground policy masks only cars
+and pedestrians. YOLO is used only to mask those foreground actors;
+this stage does not create tracks or infer depth. Stage 1 normalizes variable-rate input
+to CFR, rejects cuts, registers minimal hover jitter to the temporal center, and creates:
+
+- `stage1_out/ground.png` — conventional top-left-origin RGBA static background;
+- `stage1_out/video_cfr.*` — exact video all later stages must consume;
+- `stage1_out/valid_mask.png` — pixels supported by enough registered observations;
+- `stage1_out/temporal_variation.png` — non-semantic temporal-change diagnostic;
+- `stage1_out/foreground_frequency.png`, `semantic_exclusion_mask.png`, and
+  `inpaint_mask.png` — semantic cleanup and conservative repair evidence;
+- `stage1_out/detection_preview.png` and `reference_foreground_mask.png` — the
+  reference-frame boxes and exact expanded mask for mandatory visual inspection;
+- `stage1_out/frame_transforms_to_reference.npy` — one transform for every CFR frame;
+- `stage1_out/sample_transforms_to_reference.npy` — directly measured sample transforms;
+- `stage1_out/registration.json` — per-sample registration evidence;
+- `stage1_out/frame_geometry.json` — every consecutive-frame geometry estimate used to
+  reject sudden zoom, translation, or rotation jumps between reconstruction samples;
+- `stage1_out/report.json` — provenance, quality metrics, gate result, and assumptions.
+
+The gate verifies camera stability and reconstruction evidence; it cannot prove that a
+camera is truly nadir or that any detector found every aerial-view actor. Inspect
+`detection_preview.png`, `reference_foreground_mask.png`, `ground.png`, and the temporal
+masks before accepting a run. The exact checkpoint hash and class map are saved in each
+report. The versioned artifact and coordinate contract is documented in
+[`docs/STAGE1_CONTRACT.md`](docs/STAGE1_CONTRACT.md).
+
+The pinned checkpoint and Ultralytics code are AGPL-3.0 licensed. Confirm that this is
+compatible with the intended distribution model before shipping the eventual product.
+
+The clean Unity project for this contract is
+[`UnityProject/DroneWorldRecreation`](UnityProject/DroneWorldRecreation). It rejects
+failed Stage 1 bundles and does not reuse the legacy Unity scene or coordinate logic.
+
+Run Stage 1 end-to-end from inside Unity with **Drone World → Run Stage 1 Pipeline...**,
+or with Unity closed:
+
+```powershell
+.venv\Scripts\python.exe pipeline.py stage1 path\to\stationary_top_down.mp4
+```
+
+Run the focused tests with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Legacy pipeline documentation (reference only)
+
+Everything below describes the reverted end-to-end implementation. It is intentionally
+retained for design reference, but it is not the authoritative workflow for the staged
+rebuild and should not be used to feed the new Unity project.
+
 Turn a **pre-recorded drone video** into a schematic Unity world: a flat ground plane
 textured with a clean top-down image stitched from your footage, plus every detected
 person and vehicle replayed as a moving marker on their real-world path.
