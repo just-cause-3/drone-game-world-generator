@@ -5,6 +5,11 @@ __pycache__/
 # Generated computer-vision artifacts
 out/
 stage1_out/
+stage2_out/
+stage3_out/
+.stage1_out-*/
+.stage2_out-*/
+.stage3_out-*/
 frames/
 masks/
 *.pt
@@ -24,6 +29,8 @@ sample_vids/*.mp4
 # Imported Stage 1 bundles are reproducible and can contain large images/videos.
 /UnityProject/DroneWorldRecreation/Assets/Generated/
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage1Preview.unity*
+/UnityProject/DroneWorldRecreation/Assets/Scenes/Stage2MetricWorld.unity*
+/UnityProject/DroneWorldRecreation/Assets/Scenes/Stage3ActorPlayback.unity*
 
 # Superseded experimental Unity project retained locally for reference only.
 /UnityProject/My project/
