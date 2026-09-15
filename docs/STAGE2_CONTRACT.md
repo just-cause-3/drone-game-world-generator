@@ -55,3 +55,37 @@ code must not copy image `v` directly into Unity `Z`.
 `calibration_overlay.png` is mandatory visual evidence. It labels every clicked point,
 its metric coordinate, and its residual error. `control_points_used.json` is a
 normalized copy of the exact input.
+
+## Quality gate
+
+Defaults:
+
+| Check | Default |
+|---|---:|
+| Minimum control points | 4 |
+| Recommended points | 6 |
+| Minimum image convex-hull coverage | 8% |
+| Minimum world convex-hull area | 1 m² |
+| Maximum reprojection RMSE | 0.25 m |
+| Maximum single-point error | 0.75 m |
+| Maximum local anisotropy | 3.0 |
+
+The transform must also remain finite, preserve one consistent handedness, and avoid
+crossing projective infinity everywhere in the image. A failed artifact must never
+resize the Unity ground or enable metric vehicle placement.
+
+## Provenance and downstream use
+
+The calibration is bound to the exact Stage 1 `report.json` and `ground.png` hashes.
+Changing the input footage or regenerating Stage 1 invalidates it.
+
+For a point in CFR video frame `n`:
+
+```text
+p_reference = frame_transforms_to_reference[n] @ [u, v, 1]
+p_world_xz   = reference_pixel_to_world_xz @ p_reference
+p_world_xz  /= p_world_xz[2]
+unity        = (p_world_xz[0], ground_y_m, p_world_xz[1])
+```
+
+This composition is the basis of Stage 3 car and pedestrian trajectories.
