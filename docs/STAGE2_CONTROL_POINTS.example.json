@@ -1,0 +1,30 @@
+{
+  "schema_version": "stage2-control-points-v1",
+  "units": "meters",
+  "origin_description": "north-west surveyed pavement corner",
+  "x_axis_description": "east/right",
+  "z_axis_description": "north/forward",
+  "ground_y_m": 0.0,
+  "points": [
+    {
+      "id": "gcp_01",
+      "image": { "u": 120.0, "v": 100.0 },
+      "world": { "x": 0.0, "z": 20.0 }
+    },
+    {
+      "id": "gcp_02",
+      "image": { "u": 1150.0, "v": 105.0 },
+      "world": { "x": 30.0, "z": 20.0 }
+    },
+    {
+      "id": "gcp_03",
+      "image": { "u": 1160.0, "v": 640.0 },
+      "world": { "x": 30.0, "z": 0.0 }
+    },
+    {
+      "id": "gcp_04",
+      "image": { "u": 110.0, "v": 635.0 },
+      "world": { "x": 0.0, "z": 0.0 }
+    }
+  ]
+}
