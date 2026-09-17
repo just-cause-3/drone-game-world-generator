@@ -117,3 +117,82 @@ def _load_stage1_bundle(bundle_directory) -> tuple[Path, dict, Path]:
             f"Stage 1 ground is {ground.shape[1]}x{ground.shape[0]}, "
             f"but report declares {width}x{height}")
     return root, report, ground_path
+
+
+def _load_control_points(path, width: int, height: int, minimum: int):
+    control_path = Path(path).resolve()
+    data = _read_json(control_path)
+    if data.get("schema_version") != CONTROL_POINTS_SCHEMA:
+        raise ValueError(
+            f"unsupported control-point schema {data.get('schema_version')!r}; "
+            f"expected {CONTROL_POINTS_SCHEMA!r}")
+    if data.get("units") != "meters":
+        raise ValueError("Stage 2 control-point units must be 'meters'")
+    raw_points = data.get("points")
+    if not isinstance(raw_points, list) or len(raw_points) < minimum:
+        raise ValueError(f"Stage 2 requires at least {minimum} control points")
+
+    points = []
+    identifiers = set()
+    for index, raw in enumerate(raw_points):
+        if not isinstance(raw, dict):
+            raise ValueError(f"control point {index} must be an object")
+        identifier = str(raw.get("id", "")).strip()
+        if not identifier:
+            raise ValueError(f"control point {index} has no id")
+        if identifier in identifiers:
+            raise ValueError(f"duplicate control-point id: {identifier}")
+        identifiers.add(identifier)
+        try:
+            image = raw["image"]
+            world = raw["world"]
+            u = _finite_number(image["u"], f"{identifier}.image.u")
+            v = _finite_number(image["v"], f"{identifier}.image.v")
+            x = _finite_number(world["x"], f"{identifier}.world.x")
+            z = _finite_number(world["z"], f"{identifier}.world.z")
+        except (KeyError, TypeError) as exception:
+            raise ValueError(
+                f"control point {identifier!r} must define image u/v and world x/z") \
+                from exception
+        if not 0.0 <= u <= width - 1 or not 0.0 <= v <= height - 1:
+            raise ValueError(
+                f"control point {identifier!r} is outside the {width}x{height} image")
+        points.append({
+            "id": identifier,
+            "image": {"u": u, "v": v},
+            "world": {"x": x, "z": z},
+        })
+
+    image_points = np.array(
+        [[point["image"]["u"], point["image"]["v"]] for point in points],
+        dtype=np.float64)
+    world_points = np.array(
+        [[point["world"]["x"], point["world"]["z"]] for point in points],
+        dtype=np.float64)
+    if len(np.unique(np.round(image_points, 6), axis=0)) != len(points):
+        raise ValueError("control points contain duplicate image coordinates")
+    if len(np.unique(np.round(world_points, 6), axis=0)) != len(points):
+        raise ValueError("control points contain duplicate world coordinates")
+
+    metadata = {
+        "calibration_mode": str(
+            data.get("calibration_mode", "measured_control_points")).strip(),
+        "assumed_world_width_m": (
+            _finite_number(data["assumed_world_width_m"],
+                           "assumed_world_width_m")
+            if data.get("assumed_world_width_m") is not None else None),
+        "origin_description": str(data.get("origin_description", "")).strip(),
+        "x_axis_description": str(data.get("x_axis_description", "right/east")).strip(),
+        "z_axis_description": str(data.get("z_axis_description", "forward/north")).strip(),
+        "ground_y_m": _finite_number(data.get("ground_y_m", 0.0), "ground_y_m"),
+    }
+    if metadata["calibration_mode"] not in {
+            "measured_control_points", "approximate_image_extent"}:
+        raise ValueError(
+            f"unsupported calibration_mode: {metadata['calibration_mode']!r}")
+    if (metadata["calibration_mode"] == "approximate_image_extent" and
+            (metadata["assumed_world_width_m"] is None or
+             metadata["assumed_world_width_m"] <= 0.0)):
+        raise ValueError(
+            "approximate_image_extent requires a positive assumed_world_width_m")
+    return control_path, points, image_points, world_points, metadata
