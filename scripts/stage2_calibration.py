@@ -82,3 +82,38 @@ def _finite_number(value, label: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{label} must be a finite number")
     return number
+
+
+def _load_stage1_bundle(bundle_directory) -> tuple[Path, dict, Path]:
+    root = Path(bundle_directory).resolve()
+    report_path = root / "report.json"
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Stage 1 report not found: {report_path}")
+    report = _read_json(report_path)
+    if report.get("schema_version") != STAGE1_SCHEMA or report.get("stage") != 1:
+        raise ValueError("the selected directory is not a Stage 1 ground bundle")
+    if report.get("pass") is not True:
+        raise ValueError("Stage 2 refuses a Stage 1 bundle that failed its quality gate")
+    try:
+        width = int(report["input"]["width"])
+        height = int(report["input"]["height"])
+        ground_relative = report["outputs"]["ground"]
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("Stage 1 report is missing input dimensions or ground output") from exception
+    if width <= 0 or height <= 0:
+        raise ValueError("Stage 1 report contains invalid image dimensions")
+    ground_path = (root / ground_relative).resolve()
+    try:
+        ground_path.relative_to(root)
+    except ValueError as exception:
+        raise ValueError("Stage 1 ground path escapes its bundle")
+    if not ground_path.is_file():
+        raise FileNotFoundError(f"Stage 1 ground image not found: {ground_path}")
+    ground = cv2.imread(str(ground_path), cv2.IMREAD_UNCHANGED)
+    if ground is None:
+        raise ValueError(f"Stage 1 ground image is unreadable: {ground_path}")
+    if ground.shape[1] != width or ground.shape[0] != height:
+        raise ValueError(
+            f"Stage 1 ground is {ground.shape[1]}x{ground.shape[0]}, "
+            f"but report declares {width}x{height}")
+    return root, report, ground_path
