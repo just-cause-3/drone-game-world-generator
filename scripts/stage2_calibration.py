@@ -196,3 +196,32 @@ def _load_control_points(path, width: int, height: int, minimum: int):
         raise ValueError(
             "approximate_image_extent requires a positive assumed_world_width_m")
     return control_path, points, image_points, world_points, metadata
+
+
+def _convex_hull_area(points: np.ndarray) -> float:
+    hull = cv2.convexHull(points.astype(np.float32))
+    return float(abs(cv2.contourArea(hull)))
+
+
+def _project(homography: np.ndarray, points: np.ndarray) -> np.ndarray:
+    projected = cv2.perspectiveTransform(
+        points.astype(np.float64).reshape(-1, 1, 2), homography)
+    return projected.reshape(-1, 2)
+
+
+def _jacobian(homography: np.ndarray, u: float, v: float) -> np.ndarray:
+    h = homography
+    denominator = h[2, 0] * u + h[2, 1] * v + h[2, 2]
+    x_numerator = h[0, 0] * u + h[0, 1] * v + h[0, 2]
+    z_numerator = h[1, 0] * u + h[1, 1] * v + h[1, 2]
+    denominator_sq = denominator * denominator
+    return np.array([
+        [
+            (h[0, 0] * denominator - x_numerator * h[2, 0]) / denominator_sq,
+            (h[0, 1] * denominator - x_numerator * h[2, 1]) / denominator_sq,
+        ],
+        [
+            (h[1, 0] * denominator - z_numerator * h[2, 0]) / denominator_sq,
+            (h[1, 1] * denominator - z_numerator * h[2, 1]) / denominator_sq,
+        ],
+    ], dtype=np.float64)
