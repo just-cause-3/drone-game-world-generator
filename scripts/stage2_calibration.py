@@ -311,3 +311,194 @@ def _publish_directory(temporary: Path, output: Path) -> None:
                 f"refusing to replace unrelated output directory: {output}")
         shutil.rmtree(output)
     temporary.replace(output)
+
+
+def run_stage2(stage1_bundle, control_points_path, output_directory="stage2_out",
+               options: Stage2Options | None = None) -> dict:
+    options = options or Stage2Options()
+    options.validate()
+    stage1_root, stage1_report, ground_path = _load_stage1_bundle(stage1_bundle)
+    width = int(stage1_report["input"]["width"])
+    height = int(stage1_report["input"]["height"])
+    (control_path, points, image_points,
+     world_points, metadata) = _load_control_points(
+        control_points_path, width, height, options.min_points)
+
+    image_hull_area_pct = (
+        100.0 * _convex_hull_area(image_points) / float(width * height))
+    world_hull_area_m2 = _convex_hull_area(world_points)
+    homography, _ = cv2.findHomography(image_points, world_points, method=0)
+    if homography is None or not np.all(np.isfinite(homography)):
+        raise ValueError("control points do not define a finite pixel-to-world transform")
+    if abs(float(homography[2, 2])) <= 1e-12:
+        raise ValueError("calibration homography cannot be normalized")
+    homography = homography / homography[2, 2]
+
+    projected = _project(homography, image_points)
+    error_vectors = projected - world_points
+    errors = np.linalg.norm(error_vectors, axis=1)
+    rmse = float(math.sqrt(np.mean(np.square(errors))))
+    max_error = float(np.max(errors))
+    quality = _transform_quality(
+        homography, width, height, options.validation_grid_size)
+
+    corners_pixels = np.array([
+        [0.0, 0.0],
+        [width - 1.0, 0.0],
+        [width - 1.0, height - 1.0],
+        [0.0, height - 1.0],
+    ], dtype=np.float64)
+    corners_world = _project(homography, corners_pixels)
+
+    failure_reasons = []
+    if image_hull_area_pct < options.min_image_hull_area_pct:
+        failure_reasons.append(
+            f"control points cover {image_hull_area_pct:.2f}% of the image; "
+            f"minimum is {options.min_image_hull_area_pct:.2f}%")
+    if world_hull_area_m2 < options.min_world_hull_area_m2:
+        failure_reasons.append(
+            f"control points cover only {world_hull_area_m2:.3f} square metres")
+    if rmse > options.max_reprojection_rmse_m:
+        failure_reasons.append(
+            f"reprojection RMSE {rmse:.3f} m exceeds "
+            f"{options.max_reprojection_rmse_m:.3f} m")
+    if max_error > options.max_reprojection_error_m:
+        failure_reasons.append(
+            f"maximum control-point error {max_error:.3f} m exceeds "
+            f"{options.max_reprojection_error_m:.3f} m")
+    if not quality["finite_across_image"]:
+        failure_reasons.append("pixel-to-world transform is not finite across the image")
+    if not quality["projective_denominator_has_constant_sign"]:
+        failure_reasons.append("pixel-to-world transform crosses infinity inside the image")
+    if not quality["jacobian_handedness_has_constant_sign"]:
+        failure_reasons.append("pixel-to-world transform folds over inside the image")
+    if quality["max_local_anisotropy"] > options.max_local_anisotropy:
+        failure_reasons.append(
+            f"local scale anisotropy {quality['max_local_anisotropy']:.3f} exceeds "
+            f"{options.max_local_anisotropy:.3f}")
+
+    approximate = metadata["calibration_mode"] == "approximate_image_extent"
+    confidence = (
+        "approximate_assumed_scale" if approximate
+        else "minimum_unverified" if len(points) == 4
+        else "measured" if len(points) < options.recommended_points
+        else "well_constrained")
+    warnings = []
+    if approximate:
+        warnings.append(
+            "World scale is an operator-selected approximation, not a physical "
+            "measurement. Distances, object sizes, and speeds are not metric evidence.")
+    elif len(points) == 4:
+        warnings.append(
+            "Four points solve a homography exactly, so reprojection error is not an "
+            "independent accuracy check; add at least two more surveyed points.")
+    elif len(points) < options.recommended_points:
+        warnings.append(
+            f"Use at least {options.recommended_points} points for stronger validation.")
+
+    point_results = []
+    for point, projected_point, error in zip(points, projected, errors):
+        item = dict(point)
+        item["projected_world"] = {
+            "x": round(float(projected_point[0]), 9),
+            "z": round(float(projected_point[1]), 9),
+        }
+        item["error_m"] = round(float(error), 9)
+        point_results.append(item)
+
+    calibration = {
+        "schema_version": CALIBRATION_SCHEMA,
+        "stage": 2,
+        "pass": not failure_reasons,
+        "failure_reasons": failure_reasons,
+        "warnings": warnings,
+        "confidence": confidence,
+        "source_stage1": {
+            "bundle_path": str(stage1_root),
+            "report_sha256": _sha256(stage1_root / "report.json"),
+            "ground_sha256": _sha256(ground_path),
+            "source_video_sha256": stage1_report["input"].get("sha256"),
+            "reference_video_frame": stage1_report["reference"].get("video_frame"),
+            "pixel_width": width,
+            "pixel_height": height,
+        },
+        "coordinate_system": {
+            "input_space": "stage1_reference_image_pixels",
+            "input_origin": "top_left",
+            "input_u_axis": "right",
+            "input_v_axis": "down",
+            "output_space": "unity_world_xz",
+            "units": "meters",
+            "calibration_mode": metadata["calibration_mode"],
+            "metric_scale_is_assumed": approximate,
+            "assumed_world_width_m": metadata["assumed_world_width_m"],
+            "ground_y_m": metadata["ground_y_m"],
+            "origin_description": metadata["origin_description"],
+            "x_axis_description": metadata["x_axis_description"],
+            "z_axis_description": metadata["z_axis_description"],
+        },
+        "control_points": point_results,
+        "quality": {
+            "point_count": len(points),
+            "independent_residual_degrees_of_freedom": max(0, 2 * len(points) - 8),
+            "image_convex_hull_area_pct": round(image_hull_area_pct, 6),
+            "world_convex_hull_area_m2": round(world_hull_area_m2, 6),
+            "reprojection_rmse_m": round(rmse, 9),
+            "reprojection_max_error_m": round(max_error, 9),
+            **quality,
+        },
+        "reference_pixel_to_world_xz": [
+            [round(float(value), 12) for value in row] for row in homography
+        ],
+        "reference_pixel_to_world_xz_flat": [
+            round(float(value), 12) for value in homography.reshape(-1)
+        ],
+        "image_corners_world_xz": [
+            {
+                "u": float(pixel[0]),
+                "v": float(pixel[1]),
+                "x": round(float(world[0]), 9),
+                "z": round(float(world[1]), 9),
+            }
+            for pixel, world in zip(corners_pixels, corners_world)
+        ],
+        "world_bounds": {
+            "min_x": round(float(np.min(corners_world[:, 0])), 9),
+            "max_x": round(float(np.max(corners_world[:, 0])), 9),
+            "min_z": round(float(np.min(corners_world[:, 1])), 9),
+            "max_z": round(float(np.max(corners_world[:, 1])), 9),
+        },
+        "options": asdict(options),
+        "outputs": {
+            "calibration": "world_calibration.json",
+            "overlay": "calibration_overlay.png",
+            "control_points": "control_points_used.json",
+        },
+    }
+
+    output = Path(output_directory).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}-", dir=str(output.parent)))
+    try:
+        (temporary / OUTPUT_MARKER).write_text(
+            CALIBRATION_SCHEMA + "\n", encoding="utf-8")
+        (temporary / "world_calibration.json").write_text(
+            json.dumps(calibration, indent=2) + "\n", encoding="utf-8")
+        normalized_input = {
+            "schema_version": CONTROL_POINTS_SCHEMA,
+            "units": "meters",
+            **metadata,
+            "points": points,
+            "source_path": str(control_path),
+        }
+        (temporary / "control_points_used.json").write_text(
+            json.dumps(normalized_input, indent=2) + "\n", encoding="utf-8")
+        _draw_overlay(
+            ground_path, points, errors, temporary / "calibration_overlay.png")
+        _publish_directory(temporary, output)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return calibration
