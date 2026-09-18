@@ -225,3 +225,89 @@ def _jacobian(homography: np.ndarray, u: float, v: float) -> np.ndarray:
             (h[1, 1] * denominator - z_numerator * h[2, 1]) / denominator_sq,
         ],
     ], dtype=np.float64)
+
+
+def _transform_quality(homography: np.ndarray, width: int, height: int,
+                       grid_size: int) -> dict:
+    us = np.linspace(0.0, width - 1.0, grid_size)
+    vs = np.linspace(0.0, height - 1.0, grid_size)
+    denominators = []
+    scales = []
+    anisotropies = []
+    handedness = []
+    for v in vs:
+        for u in us:
+            denominator = float(
+                homography[2, 0] * u +
+                homography[2, 1] * v +
+                homography[2, 2])
+            denominators.append(denominator)
+            if abs(denominator) < 1e-10:
+                continue
+            jacobian = _jacobian(homography, float(u), float(v))
+            singular_values = np.linalg.svd(jacobian, compute_uv=False)
+            if singular_values[-1] <= 1e-12:
+                anisotropy = math.inf
+            else:
+                anisotropy = float(singular_values[0] / singular_values[-1])
+            scales.append(float(math.sqrt(abs(np.linalg.det(jacobian)))))
+            anisotropies.append(anisotropy)
+            handedness.append(float(np.linalg.det(jacobian)))
+
+    finite = (
+        all(math.isfinite(value) for value in denominators + scales + anisotropies) and
+        bool(scales))
+    same_denominator_sign = (
+        min(denominators) > 1e-10 or max(denominators) < -1e-10)
+    same_handedness = (
+        min(handedness, default=0.0) > 0.0 or
+        max(handedness, default=0.0) < 0.0)
+    return {
+        "finite_across_image": finite,
+        "projective_denominator_has_constant_sign": same_denominator_sign,
+        "jacobian_handedness_has_constant_sign": same_handedness,
+        "handedness": (
+            "preserved" if float(np.median(handedness)) > 0.0 else "reflected"),
+        "meters_per_pixel_min": round(min(scales, default=0.0), 9),
+        "meters_per_pixel_median": round(float(np.median(scales)) if scales else 0.0, 9),
+        "meters_per_pixel_max": round(max(scales, default=0.0), 9),
+        "max_local_anisotropy": round(max(anisotropies, default=math.inf), 6),
+    }
+
+
+def _draw_overlay(ground_path: Path, points: list[dict],
+                  errors: np.ndarray, destination: Path) -> None:
+    image = cv2.imread(str(ground_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"could not render calibration overlay from {ground_path}")
+    radius = max(5, round(min(image.shape[:2]) / 120))
+    for point, error in zip(points, errors):
+        u = round(point["image"]["u"])
+        v = round(point["image"]["v"])
+        label = (
+            f"{point['id']} ({point['world']['x']:.2f},"
+            f" {point['world']['z']:.2f}) e={float(error):.3f}m")
+        cv2.circle(image, (u, v), radius + 3, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(image, (u, v), radius, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            image, label, (u + radius + 5, max(18, v - radius - 3)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(
+            image, label, (u + radius + 5, max(18, v - radius - 3)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    if not cv2.imwrite(str(destination), image):
+        raise IOError(f"could not write calibration overlay: {destination}")
+
+
+def _publish_directory(temporary: Path, output: Path) -> None:
+    if output.exists():
+        marker = output / OUTPUT_MARKER
+        if not output.is_dir():
+            raise ValueError(
+                f"refusing to replace unrelated output directory: {output}")
+        has_contents = any(output.iterdir())
+        if has_contents and not marker.is_file():
+            raise ValueError(
+                f"refusing to replace unrelated output directory: {output}")
+        shutil.rmtree(output)
+    temporary.replace(output)
