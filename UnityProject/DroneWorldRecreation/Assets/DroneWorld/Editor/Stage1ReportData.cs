@@ -21,6 +21,8 @@ namespace DroneWorld.Stage1.Editor
         public string sha256;
         public int width;
         public int height;
+        public float fps;
+        public int frame_count;
     }
 
     [Serializable]
@@ -41,5 +43,6 @@ namespace DroneWorld.Stage1.Editor
         public string inpaint_mask;
         public string registration;
         public string video_cfr;
+        public string frame_transforms;
     }
 }
