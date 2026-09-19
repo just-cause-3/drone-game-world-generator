@@ -160,6 +160,57 @@ class Stage2CalibrationTests(unittest.TestCase):
                 "not a physical measurement" in warning
                 for warning in result["warnings"]))
 
+    def test_rejects_clustered_control_points(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            stage1 = _stage1_bundle(root)
+            image_points = np.array([
+                [100, 100], [120, 100], [120, 120],
+                [100, 120], [110, 105], [105, 115],
+            ], dtype=np.float64)
+            world_points = image_points * np.array([0.05, -0.05])
+            points_path = _write_points(
+                root / "points.json", image_points, world_points)
+
+            result = run_stage2(stage1, points_path, root / "stage2")
+
+            self.assertFalse(result["pass"])
+            self.assertTrue(any(
+                "control points cover" in reason
+                for reason in result["failure_reasons"]))
+
+    def test_rejects_inconsistent_measured_point(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            stage1 = _stage1_bundle(root)
+            image_points = np.array([
+                [20, 20], [200, 15], [380, 25],
+                [25, 275], [205, 285], [375, 270],
+            ], dtype=np.float64)
+            world_points = image_points * np.array([0.05, -0.05])
+            world_points[2] += np.array([4.0, 3.0])
+            points_path = _write_points(
+                root / "points.json", image_points, world_points)
+
+            result = run_stage2(
+                stage1, points_path, root / "stage2",
+                Stage2Options(max_reprojection_rmse_m=0.1,
+                              max_reprojection_error_m=0.2))
+
+            self.assertFalse(result["pass"])
+            self.assertTrue(any(
+                "reprojection" in reason or "control-point error" in reason
+                for reason in result["failure_reasons"]))
+
+    def test_refuses_failed_stage1_bundle(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            stage1 = _stage1_bundle(root, passing=False)
+            points_path = root / "points.json"
+            points_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "failed its quality gate"):
+                run_stage2(stage1, points_path, root / "stage2")
+
 
 if __name__ == "__main__":
     unittest.main()
