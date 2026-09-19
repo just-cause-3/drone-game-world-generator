@@ -211,6 +211,81 @@ class Stage2CalibrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "failed its quality gate"):
                 run_stage2(stage1, points_path, root / "stage2")
 
+    def test_refuses_to_replace_unrelated_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            stage1 = _stage1_bundle(root)
+            image_points = np.array([
+                [20, 20], [380, 20], [380, 280], [20, 280],
+            ], dtype=np.float64)
+            world_points = np.array([
+                [0, 20], [30, 20], [30, 0], [0, 0],
+            ], dtype=np.float64)
+            points_path = _write_points(
+                root / "points.json", image_points, world_points)
+            output = root / "unrelated"
+            output.mkdir()
+            (output / "keep.txt").write_text("user data", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unrelated output"):
+                run_stage2(stage1, points_path, output)
+            self.assertEqual(
+                (output / "keep.txt").read_text(encoding="utf-8"), "user data")
+
+    def test_accepts_an_existing_empty_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            stage1 = _stage1_bundle(root)
+            image_points = np.array([
+                [20, 20], [380, 20], [380, 280], [20, 280],
+            ], dtype=np.float64)
+            world_points = np.array([
+                [0, 20], [30, 20], [30, 0], [0, 0],
+            ], dtype=np.float64)
+            points_path = _write_points(
+                root / "points.json", image_points, world_points)
+            output = root / "empty"
+            output.mkdir()
+
+            result = run_stage2(stage1, points_path, output)
+
+            self.assertTrue(result["pass"])
+            self.assertTrue((output / "world_calibration.json").is_file())
+
+    def test_pipeline_stage2_returns_quality_gate_status(self):
+        from unittest.mock import patch
+
+        with patch("pipeline.run_stage2") as run_stage2_mock:
+            run_stage2_mock.return_value = {
+                "pass": False,
+                "failure_reasons": ["points are clustered"],
+            }
+            result = pipeline.main([
+                "stage2", "stage1_out", "points.json",
+                "--output", "stage2_out",
+            ])
+        self.assertEqual(result, 2)
+
+    def test_pipeline_stage2_reports_pass(self):
+        from unittest.mock import patch
+
+        with patch("pipeline.run_stage2") as run_stage2_mock:
+            run_stage2_mock.return_value = {
+                "pass": True,
+                "failure_reasons": [],
+                "warnings": [],
+                "quality": {
+                    "point_count": 6,
+                    "reprojection_rmse_m": 0.01,
+                },
+            }
+            result = pipeline.main([
+                "stage2", "stage1_out", "points.json",
+                "--output", "stage2_out",
+            ])
+        self.assertEqual(result, 0)
+        run_stage2_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
