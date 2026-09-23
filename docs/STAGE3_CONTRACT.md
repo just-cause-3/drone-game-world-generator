@@ -71,3 +71,75 @@ A constant-velocity Rauch-Tung-Striebel pass smooths confirmed observations befo
 playback samples are written. A segment needs at least five observed frames before it
 is allowed into playback, preventing very short detector flicker from spawning an
 actor.
+
+## Artifact bundle (`stage3-tracks-v1`)
+
+Stage 3 publishes atomically and replaces only an existing directory containing its
+private `.stage3-tracks-output` marker.
+
+| Artifact | Contract |
+| --- | --- |
+| `report.json` | Pass/fail, upstream/model hashes, exact options, coordinate policy, detector/tracker metadata, warnings, limitations, and quality metrics |
+| `detections.jsonl` | One audit record per merged detection, including source box/anchor, stabilized reference box/anchor, world anchor, score, detector class, inference passes, and assigned identity when available |
+| `tracks.json` | Unity runtime contract: exact FPS/frame count/duration and ordered car/person tracks with frame, derived timestamp, X/Z, heading, speed, observed flag, and confidence |
+| `tracking_preview.mp4` | Annotated video on the exact CFR timeline |
+| `track_map.png` | Confirmed stabilized trajectories drawn over the Stage 1 ground |
+| `frame_counts.csv` | Per-frame detections, assignments, and active-track count |
+
+An empty scene may pass with a warning. Stage 3 must not invent an actor to satisfy a
+minimum-track gate. Short unconfirmed fragments are discarded and reported.
+
+## Safe retracking without repeated inference
+
+Tracker and boundary settings can be re-evaluated from an existing Stage 3 bundle:
+
+```powershell
+.venv\Scripts\python.exe stage3.py stage1_out stage2_out --output stage3_out `
+  --reuse-detections-from stage3_out
+```
+
+The cache is accepted only when its Stage 1 report, CFR video, transform stack, Stage 2
+calibration, frame count, and FPS still match. Frames are decoded again to recompute
+appearance descriptors and diagnostics; YOLO inference alone is skipped. Loading is
+completed before atomic replacement, so using the same input/output directory is safe.
+
+## Timing
+
+There is one clock:
+
+```text
+timestamp_seconds = CFR_frame_index / CFR_fps
+```
+
+Timestamps are derived rather than accumulated. Unity validates every timestamp against
+its frame number and interpolates between adjacent playback samples using this clock.
+
+## Approximate Stage 2 scale
+
+When Stage 2 confidence is `approximate_assumed_scale`, actor placement is consistent
+with the selected Unity ground size, but distances, prefab dimensions, and speeds are
+not physical measurements. Reports and UI must use “units” rather than claim surveyed
+metres.
+
+## Running
+
+From PowerShell:
+
+```powershell
+.venv\Scripts\python.exe stage3.py stage1_out stage2_out --output stage3_out
+```
+
+From Unity:
+
+1. Open/import the Stage 2 metric scene.
+2. Select **Drone World -> Stage 3 -> Run Stage 3 Tracking Pipeline...**.
+3. Confirm the Stage 2 calibration and output folder.
+4. Press **Run Stage 3** and wait for the detector to process every frame.
+5. On a pass, Unity validates the bundle and creates
+   `Assets/Scenes/Stage3ActorPlayback.unity`.
+6. Inspect `tracking_preview.mp4` and `track_map.png`, then press Unity Play.
+
+The full technology evaluation and later accuracy work are in
+`STAGE3_IMPLEMENTATION_PLAN.md`. Forward/backward reconciliation, tracker benchmarking,
+project-specific ReID, and held-out annotation metrics remain planned improvements and
+are not falsely reported as part of this initial implementation.
