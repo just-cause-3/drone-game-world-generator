@@ -146,3 +146,106 @@ def _video_info(path: Path) -> dict:
     if any(result[key] <= 0 for key in result):
         raise ValueError("Stage 1 CFR video has invalid metadata")
     return result
+
+
+def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
+    stage1_root = Path(stage1_bundle).resolve()
+    stage1_report_path = stage1_root / "report.json"
+    if not stage1_report_path.is_file():
+        raise FileNotFoundError(f"Stage 1 report not found: {stage1_report_path}")
+    stage1 = _read_json(stage1_report_path)
+    if stage1.get("schema_version") != STAGE1_SCHEMA or stage1.get("stage") != 1:
+        raise ValueError("the selected directory is not a Stage 1 bundle")
+    if stage1.get("pass") is not True:
+        raise ValueError("Stage 3 refuses a failed Stage 1 bundle")
+    try:
+        outputs = stage1["outputs"]
+        declared = {
+            "width": int(stage1["input"]["width"]),
+            "height": int(stage1["input"]["height"]),
+            "frame_count": int(stage1["input"]["frame_count"]),
+            "fps": float(stage1["input"]["fps"]),
+        }
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("Stage 1 report is missing timeline metadata") from exception
+    if any(declared[key] <= 0 for key in declared):
+        raise ValueError("Stage 1 timeline metadata is invalid")
+
+    video_path = _bundle_path(stage1_root, outputs.get("video_cfr"), "CFR video")
+    transforms_path = _bundle_path(
+        stage1_root, outputs.get("frame_transforms"), "frame transforms")
+    ground_path = _bundle_path(stage1_root, outputs.get("ground"), "ground image")
+    actual_video = _video_info(video_path)
+    for key in ("width", "height", "frame_count"):
+        if actual_video[key] != declared[key]:
+            raise ValueError(
+                f"CFR video {key}={actual_video[key]} does not match "
+                f"Stage 1 report {declared[key]}")
+    if abs(actual_video["fps"] - declared["fps"]) > max(1e-3, declared["fps"] * 1e-4):
+        raise ValueError("CFR video FPS does not match the Stage 1 report")
+
+    transforms = np.load(transforms_path, allow_pickle=False)
+    expected_shape = (declared["frame_count"], 3, 3)
+    if transforms.shape != expected_shape:
+        raise ValueError(
+            f"frame transforms have shape {transforms.shape}; expected {expected_shape}")
+    if not np.all(np.isfinite(transforms)):
+        raise ValueError("frame transforms contain non-finite values")
+    determinants = np.linalg.det(transforms)
+    if np.any(np.abs(determinants) < 1e-10):
+        raise ValueError("frame transforms contain a singular matrix")
+
+    stage2_root = Path(stage2_bundle).resolve()
+    calibration_path = stage2_root / "world_calibration.json"
+    if not calibration_path.is_file():
+        raise FileNotFoundError(f"Stage 2 calibration not found: {calibration_path}")
+    stage2 = _read_json(calibration_path)
+    if stage2.get("schema_version") != STAGE2_SCHEMA or stage2.get("stage") != 2:
+        raise ValueError("the selected directory is not a Stage 2 calibration bundle")
+    if stage2.get("pass") is not True:
+        raise ValueError("Stage 3 refuses a failed Stage 2 calibration")
+    try:
+        source2 = stage2["source_stage1"]
+        matrix = np.asarray(stage2["reference_pixel_to_world_xz"], dtype=np.float64)
+        confidence = str(stage2["confidence"])
+        coordinate_system = stage2["coordinate_system"]
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("Stage 2 calibration is missing required data") from exception
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("Stage 2 pixel-to-world transform is not a finite 3x3 matrix")
+    if abs(float(np.linalg.det(matrix))) < 1e-12:
+        raise ValueError("Stage 2 pixel-to-world transform is singular")
+    if source2.get("report_sha256") != _sha256(stage1_report_path):
+        raise ValueError("Stage 2 calibration is stale: Stage 1 report hash changed")
+    if source2.get("ground_sha256") != _sha256(ground_path):
+        raise ValueError("Stage 2 calibration is stale: Stage 1 ground hash changed")
+    if source2.get("source_video_sha256") != stage1["input"].get("sha256"):
+        raise ValueError("Stage 2 calibration was created for a different source video")
+    if (int(source2.get("pixel_width", -1)) != declared["width"] or
+            int(source2.get("pixel_height", -1)) != declared["height"]):
+        raise ValueError("Stage 2 calibration dimensions do not match Stage 1")
+
+    ground = cv2.imread(str(ground_path), cv2.IMREAD_COLOR)
+    if ground is None or ground.shape[:2] != (declared["height"], declared["width"]):
+        raise ValueError("Stage 1 ground image is unreadable or dimensionally inconsistent")
+    return {
+        "stage1_root": stage1_root,
+        "stage1": stage1,
+        "stage1_report_path": stage1_report_path,
+        "stage2_root": stage2_root,
+        "stage2": stage2,
+        "calibration_path": calibration_path,
+        "video_path": video_path,
+        "video_sha256": _sha256(video_path),
+        "transforms_path": transforms_path,
+        "transforms_sha256": _sha256(transforms_path),
+        "transforms": transforms,
+        "ground_path": ground_path,
+        "ground": ground,
+        "pixel_to_world": matrix,
+        "scale_confidence": confidence,
+        "metric_scale_is_assumed": bool(
+            coordinate_system.get("metric_scale_is_assumed", False)),
+        "ground_y": float(coordinate_system.get("ground_y_m", 0.0)),
+        **declared,
+    }
