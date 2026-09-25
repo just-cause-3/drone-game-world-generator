@@ -341,3 +341,132 @@ def _canonical_nms(candidates: list[dict], threshold: float) -> list[dict]:
             group = remaining
     merged.sort(key=lambda item: (item["kind"], -item["confidence"], item["bbox_xyxy"]))
     return merged
+
+
+class YoloActorDetector:
+    def __init__(self, options: Stage3Options):
+        from ultralytics import YOLO
+
+        self.options = options
+        self.device = resolve_device("auto")
+        requested = Path(str(options.detector_model))
+        repository_model = Path(__file__).resolve().parents[1] / requested
+        model_path = (repository_model if not requested.is_absolute() and
+                      repository_model.exists() else requested)
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"drone detector is missing: {model_path}. Run "
+                "'.venv\\Scripts\\python.exe setup_drone_model.py' once.")
+        self.model_path = model_path.resolve()
+        model_sha256 = _sha256(self.model_path)
+        self.model_sha256 = model_sha256
+        if (str(options.detector_model) == DEFAULT_FOREGROUND_MODEL and
+                model_sha256 != MODEL_SHA256):
+            raise ValueError(
+                "default drone detector hash does not match the pinned checkpoint; "
+                "run '.venv\\Scripts\\python.exe setup_drone_model.py --verify-only'")
+        self.model = YOLO(str(self.model_path))
+        raw_names = self.model.names
+        self.model_names = {
+            int(key): str(value) for key, value in
+            (raw_names.items() if isinstance(raw_names, dict) else enumerate(raw_names))
+        }
+        if (str(options.detector_model) == DEFAULT_FOREGROUND_MODEL and
+                tuple(self.model_names.values()) != EXPECTED_CLASSES):
+            raise ValueError(
+                f"default drone detector class map is not pinned: {self.model_names}")
+        self.class_kinds = {}
+        for class_id, name in self.model_names.items():
+            normalized = _normalized_class_name(name)
+            if normalized in CANONICAL_CLASSES:
+                self.class_kinds[class_id] = CANONICAL_CLASSES[normalized]
+        if set(self.class_kinds.values()) != {"car", "person"}:
+            raise ValueError(
+                "detector must contain car and pedestrian/person classes; "
+                f"model classes={self.model_names}")
+        log(
+            "stage3",
+            f"detector={self.model_path} device={self.device}; full_frame="
+            f"{options.detector_full_frame}, tile={options.detector_tile_size}, "
+            f"tta={options.detector_tta}")
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "model": str(self.model_path),
+            "model_sha256": self.model_sha256,
+            "pinned_default": str(self.options.detector_model) == DEFAULT_FOREGROUND_MODEL,
+            "device": str(self.device),
+            "model_classes": self.model_names,
+            "canonical_classes": {str(key): value for key, value in self.class_kinds.items()},
+            "low_confidence": self.options.detector_low_confidence,
+            "high_confidence": self.options.detector_high_confidence,
+            "iou": self.options.detector_iou,
+            "imgsz": self.options.detector_imgsz,
+            "full_frame": self.options.detector_full_frame,
+            "tile_size": self.options.detector_tile_size,
+            "tile_overlap": self.options.detector_tile_overlap,
+            "test_time_augmentation": self.options.detector_tta,
+        }
+
+    def _predict(self, frame: np.ndarray, x_offset: int, y_offset: int,
+                 pass_name: str) -> list[dict]:
+        result = self.model.predict(
+            frame,
+            imgsz=self.options.detector_imgsz,
+            conf=self.options.detector_low_confidence,
+            iou=self.options.detector_iou,
+            max_det=self.options.detector_max_detections,
+            classes=sorted(self.class_kinds),
+            device=self.device,
+            augment=self.options.detector_tta,
+            agnostic_nms=False,
+            end2end=False,
+            verbose=False,
+        )[0]
+        if result.boxes is None:
+            return []
+        detections = []
+        for box, class_value, score in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.cls.cpu().numpy(),
+                result.boxes.conf.cpu().numpy()):
+            class_id = int(class_value)
+            kind = self.class_kinds.get(class_id)
+            if kind is None:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in box)
+            detections.append({
+                "kind": kind,
+                "detector_class_id": class_id,
+                "detector_class": self.model_names[class_id],
+                "confidence": float(score),
+                "bbox_xyxy": [
+                    x1 + x_offset, y1 + y_offset,
+                    x2 + x_offset, y2 + y_offset,
+                ],
+                "inference_pass": pass_name,
+            })
+        return detections
+
+    def detect(self, frame: np.ndarray, frame_index: int) -> list[dict]:
+        del frame_index
+        height, width = frame.shape[:2]
+        candidates = []
+        if self.options.detector_full_frame:
+            candidates.extend(self._predict(frame, 0, 0, "full"))
+        tile_size = self.options.detector_tile_size
+        tiled = tile_size > 0 and (width > tile_size or height > tile_size)
+        if tiled:
+            tile_width = min(tile_size, width)
+            tile_height = min(tile_size, height)
+            for y0 in _tile_origins(
+                    height, tile_height, self.options.detector_tile_overlap):
+                for x0 in _tile_origins(
+                        width, tile_width, self.options.detector_tile_overlap):
+                    crop = frame[y0:y0 + tile_height, x0:x0 + tile_width]
+                    candidates.extend(self._predict(
+                        crop, x0, y0, f"tile:{x0},{y0}"))
+        if not self.options.detector_full_frame and not tiled:
+            candidates.extend(self._predict(frame, 0, 0, "single"))
+        return _canonical_nms(candidates, self.options.detector_iou)
