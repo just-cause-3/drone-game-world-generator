@@ -470,3 +470,83 @@ class YoloActorDetector:
         if not self.options.detector_full_frame and not tiled:
             candidates.extend(self._predict(frame, 0, 0, "single"))
         return _canonical_nms(candidates, self.options.detector_iou)
+
+
+class CachedActorDetector:
+    """Replay audited YOLO detections after strict upstream provenance checks."""
+    def __init__(self, bundle_directory):
+        self.bundle = Path(bundle_directory).resolve()
+        report_path = self.bundle / "report.json"
+        detections_path = self.bundle / "detections.jsonl"
+        if not report_path.is_file() or not detections_path.is_file():
+            raise FileNotFoundError(
+                "cached Stage 3 bundle must contain report.json and detections.jsonl")
+        self.report = _read_json(report_path)
+        if (self.report.get("schema_version") != STAGE3_SCHEMA or
+                self.report.get("stage") != 3):
+            raise ValueError("cached detections do not come from a Stage 3 bundle")
+        metadata = self.report.get("detector")
+        if not isinstance(metadata, dict):
+            raise ValueError("cached Stage 3 report has no detector metadata")
+        self._metadata = dict(metadata)
+        self._metadata["reused_detections"] = True
+        self._metadata["cache_source"] = str(self.bundle)
+        self.by_frame: dict[int, list[dict]] = {}
+        previous_frame = -1
+        with detections_path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                    frame = int(item["frame"])
+                    box = [float(value) for value in item["bbox_xyxy"]]
+                    confidence = float(item["confidence"])
+                    kind = str(item["kind"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exception:
+                    raise ValueError(
+                        f"invalid cached detection on line {line_number}") from exception
+                if frame < previous_frame:
+                    raise ValueError("cached detections are not frame-monotonic")
+                if kind not in {"car", "person"} or len(box) != 4 or not all(
+                        math.isfinite(value) for value in box):
+                    raise ValueError(f"invalid cached detection on line {line_number}")
+                if not 0.0 <= confidence <= 1.0:
+                    raise ValueError(f"invalid cached confidence on line {line_number}")
+                previous_frame = frame
+                self.by_frame.setdefault(frame, []).append({
+                    "kind": kind,
+                    "detector_class_id": int(item.get("detector_class_id", -1)),
+                    "detector_class": str(item.get("detector_class", kind)),
+                    "confidence": confidence,
+                    "bbox_xyxy": box,
+                    "inference_passes": list(item.get("inference_passes", [])),
+                })
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
+
+    def validate_inputs(self, inputs: dict) -> None:
+        source1 = self.report.get("source_stage1") or {}
+        source2 = self.report.get("source_stage2") or {}
+        timeline = self.report.get("timeline") or {}
+        expected = {
+            "report_sha256": _sha256(inputs["stage1_report_path"]),
+            "cfr_video_sha256": inputs["video_sha256"],
+            "frame_transforms_sha256": inputs["transforms_sha256"],
+        }
+        for key, value in expected.items():
+            if source1.get(key) != value:
+                raise ValueError(f"cached detections are stale: Stage 1 {key} changed")
+        if source2.get("calibration_sha256") != _sha256(inputs["calibration_path"]):
+            raise ValueError("cached detections are stale: Stage 2 calibration changed")
+        if (int(timeline.get("frame_count", -1)) != inputs["frame_count"] or
+                abs(float(timeline.get("fps", -1.0)) - inputs["fps"]) > 1e-3):
+            raise ValueError("cached detections use a different CFR timeline")
+        if self.by_frame and max(self.by_frame) >= inputs["frame_count"]:
+            raise ValueError("cached detections contain an out-of-range frame")
+
+    def detect(self, frame: np.ndarray, frame_index: int) -> list[dict]:
+        del frame
+        return [dict(item) for item in self.by_frame.get(frame_index, [])]
