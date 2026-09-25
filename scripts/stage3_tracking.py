@@ -249,3 +249,95 @@ def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
         "ground_y": float(coordinate_system.get("ground_y_m", 0.0)),
         **declared,
     }
+
+
+def _project_point(homography: np.ndarray, u: float, v: float) -> tuple[float, float]:
+    projected = homography @ np.array([u, v, 1.0], dtype=np.float64)
+    denominator = float(projected[2])
+    if not math.isfinite(denominator) or abs(denominator) < 1e-10:
+        raise ValueError("actor point mapped to invalid projective coordinates")
+    x = float(projected[0] / denominator)
+    y = float(projected[1] / denominator)
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError("actor point mapped to non-finite coordinates")
+    return x, y
+
+
+def _transform_box(homography: np.ndarray, box: Iterable[float]) -> list[float]:
+    x1, y1, x2, y2 = (float(value) for value in box)
+    points = np.array(
+        [[[x1, y1], [x2, y1], [x2, y2], [x1, y2]]], dtype=np.float64)
+    mapped = cv2.perspectiveTransform(points, homography)[0]
+    if not np.all(np.isfinite(mapped)):
+        raise ValueError("actor box mapped to non-finite reference coordinates")
+    return [
+        float(np.min(mapped[:, 0])), float(np.min(mapped[:, 1])),
+        float(np.max(mapped[:, 0])), float(np.max(mapped[:, 1])),
+    ]
+
+
+def _iou(first: Iterable[float], second: Iterable[float]) -> float:
+    ax1, ay1, ax2, ay2 = first
+    bx1, by1, bx2, by2 = second
+    width = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    height = max(0.0, min(ay2, by2) - max(ay1, by1))
+    intersection = width * height
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _appearance_descriptor(frame: np.ndarray, box: Iterable[float]) -> np.ndarray | None:
+    """Return a compact HSV histogram for conservative short-gap association."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = (float(value) for value in box)
+    # Use the central region to reduce background included by an axis-aligned box.
+    inset_x = 0.12 * (x2 - x1)
+    inset_y = 0.12 * (y2 - y1)
+    left = max(0, min(width, int(math.floor(x1 + inset_x))))
+    top = max(0, min(height, int(math.floor(y1 + inset_y))))
+    right = max(0, min(width, int(math.ceil(x2 - inset_x))))
+    bottom = max(0, min(height, int(math.ceil(y2 - inset_y))))
+    if right - left < 2 or bottom - top < 2:
+        return None
+    crop = frame[top:bottom, left:right]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    histogram = cv2.calcHist([hsv], [0, 1, 2], None, [12, 4, 4],
+                             [0, 180, 0, 256, 0, 256]).reshape(-1)
+    total = float(histogram.sum())
+    if total <= 0.0 or not np.all(np.isfinite(histogram)):
+        return None
+    return (histogram / total).astype(np.float32)
+
+
+def _appearance_distance(first: np.ndarray | None,
+                         second: np.ndarray | None) -> float | None:
+    if first is None or second is None or first.shape != second.shape:
+        return None
+    coefficient = float(np.sum(np.sqrt(np.maximum(first, 0.0) *
+                                       np.maximum(second, 0.0))))
+    return math.sqrt(max(0.0, 1.0 - min(1.0, coefficient)))
+
+
+def _canonical_nms(candidates: list[dict], threshold: float) -> list[dict]:
+    merged = []
+    for kind in ("car", "person"):
+        group = [candidate for candidate in candidates if candidate["kind"] == kind]
+        group.sort(key=lambda item: (-item["confidence"], item["bbox_xyxy"]))
+        while group:
+            best = group.pop(0)
+            sources = {best["inference_pass"]}
+            remaining = []
+            for candidate in group:
+                if _iou(best["bbox_xyxy"], candidate["bbox_xyxy"]) > threshold:
+                    sources.add(candidate["inference_pass"])
+                else:
+                    remaining.append(candidate)
+            best = dict(best)
+            best["inference_passes"] = sorted(sources)
+            best.pop("inference_pass", None)
+            merged.append(best)
+            group = remaining
+    merged.sort(key=lambda item: (item["kind"], -item["confidence"], item["bbox_xyxy"]))
+    return merged
