@@ -711,3 +711,132 @@ class StabilizedTracker:
 
     def all_tracks(self) -> list[_Track]:
         return sorted(self.finished + self.active, key=lambda track: track.identifier)
+
+
+def _rts_smooth(observations: list[dict], fps: float,
+                process_noise: float, measurement_noise: float) -> np.ndarray:
+    measurements = np.asarray(
+        [item["world_anchor"] for item in observations], dtype=np.float64)
+    frames = np.asarray([item["frame"] for item in observations], dtype=np.int64)
+    count = len(observations)
+    if count < 3:
+        return measurements.copy()
+    states = np.zeros((count, 4), dtype=np.float64)
+    covariances = np.zeros((count, 4, 4), dtype=np.float64)
+    predicted_states = np.zeros_like(states)
+    predicted_covariances = np.zeros_like(covariances)
+    state = np.array([measurements[0, 0], measurements[0, 1], 0.0, 0.0])
+    covariance = np.diag([measurement_noise, measurement_noise, 10.0, 10.0])
+    observation_matrix = np.array([[1.0, 0.0, 0.0, 0.0],
+                                   [0.0, 1.0, 0.0, 0.0]])
+    observation_noise = np.eye(2) * measurement_noise
+    transitions = [np.eye(4)]
+    for index in range(count):
+        if index > 0:
+            dt = (frames[index] - frames[index - 1]) / fps
+            transition = np.array([
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ])
+            transitions.append(transition)
+            q = process_noise
+            process = q * np.array([
+                [dt ** 4 / 4, 0.0, dt ** 3 / 2, 0.0],
+                [0.0, dt ** 4 / 4, 0.0, dt ** 3 / 2],
+                [dt ** 3 / 2, 0.0, dt ** 2, 0.0],
+                [0.0, dt ** 3 / 2, 0.0, dt ** 2],
+            ])
+            state = transition @ state
+            covariance = transition @ covariance @ transition.T + process
+        predicted_states[index] = state
+        predicted_covariances[index] = covariance
+        confidence = max(0.05, float(observations[index]["confidence"]))
+        adaptive_noise = observation_noise / confidence
+        innovation = measurements[index] - observation_matrix @ state
+        innovation_covariance = (
+            observation_matrix @ covariance @ observation_matrix.T + adaptive_noise)
+        gain = covariance @ observation_matrix.T @ np.linalg.inv(innovation_covariance)
+        state = state + gain @ innovation
+        covariance = (np.eye(4) - gain @ observation_matrix) @ covariance
+        states[index] = state
+        covariances[index] = covariance
+
+    smoothed = states.copy()
+    smooth_covariances = covariances.copy()
+    for index in range(count - 2, -1, -1):
+        transition = transitions[index + 1]
+        predicted_covariance = predicted_covariances[index + 1]
+        gain = (covariances[index] @ transition.T @
+                np.linalg.pinv(predicted_covariance))
+        smoothed[index] = states[index] + gain @ (
+            smoothed[index + 1] - predicted_states[index + 1])
+        smooth_covariances[index] = covariances[index] + gain @ (
+            smooth_covariances[index + 1] - predicted_covariance) @ gain.T
+    return smoothed[:, :2]
+
+
+def _playback_track(track: _Track, fps: float, options: Stage3Options) -> dict:
+    observations = sorted(track.observations, key=lambda item: item["frame"])
+    smooth_positions = _rts_smooth(
+        observations, fps, options.process_noise, options.measurement_noise)
+    samples = []
+    for index, observation in enumerate(observations):
+        start_frame = int(observation["frame"])
+        start_position = smooth_positions[index]
+        samples.append({
+            "frame": start_frame,
+            "t": round(start_frame / fps, 6),
+            "x": float(start_position[0]),
+            "z": float(start_position[1]),
+            "observed": True,
+            "confidence": float(observation["confidence"]),
+        })
+        if index + 1 >= len(observations):
+            continue
+        end_frame = int(observations[index + 1]["frame"])
+        gap = end_frame - start_frame - 1
+        if gap <= 0 or gap > options.max_interpolation_frames:
+            continue
+        end_position = smooth_positions[index + 1]
+        for frame in range(start_frame + 1, end_frame):
+            alpha = (frame - start_frame) / (end_frame - start_frame)
+            position = (1.0 - alpha) * start_position + alpha * end_position
+            samples.append({
+                "frame": frame,
+                "t": round(frame / fps, 6),
+                "x": float(position[0]),
+                "z": float(position[1]),
+                "observed": False,
+                "confidence": 0.0,
+            })
+    samples.sort(key=lambda item: item["frame"])
+    for index, sample in enumerate(samples):
+        previous = samples[max(0, index - 1)]
+        following = samples[min(len(samples) - 1, index + 1)]
+        dt = (following["frame"] - previous["frame"]) / fps
+        dx = following["x"] - previous["x"]
+        dz = following["z"] - previous["z"]
+        speed = math.hypot(dx, dz) / dt if dt > 0.0 else 0.0
+        if speed > 1e-5:
+            heading = math.degrees(math.atan2(dx, dz))
+        elif index > 0:
+            heading = samples[index - 1]["heading_deg"]
+        else:
+            heading = 0.0
+        sample["x"] = round(sample["x"], 6)
+        sample["z"] = round(sample["z"], 6)
+        sample["heading_deg"] = round(heading, 4)
+        sample["speed_units_per_s"] = round(speed, 6)
+        sample["confidence"] = round(sample["confidence"], 4)
+    confidences = [float(item["confidence"]) for item in observations]
+    return {
+        "id": track.identifier,
+        "kind": track.kind,
+        "first_frame": int(observations[0]["frame"]),
+        "last_frame": int(observations[-1]["frame"]),
+        "observed_frames": len(observations),
+        "mean_confidence": round(float(np.mean(confidences)), 4),
+        "samples": samples,
+    }
