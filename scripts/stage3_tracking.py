@@ -550,3 +550,57 @@ class CachedActorDetector:
     def detect(self, frame: np.ndarray, frame_index: int) -> list[dict]:
         del frame
         return [dict(item) for item in self.by_frame.get(frame_index, [])]
+
+
+class _Track:
+    def __init__(self, identifier: int, detection: dict):
+        self.identifier = identifier
+        self.kind = detection["kind"]
+        self.observations = [detection]
+        self.last_frame = detection["frame"]
+        self.last_position = np.asarray(detection["reference_anchor"], dtype=np.float64)
+        self.velocity = np.zeros(2, dtype=np.float64)
+        self.last_box = detection["reference_bbox_xyxy"]
+        descriptor = detection.get("_appearance")
+        self.appearance = None if descriptor is None else descriptor.copy()
+
+    def predict(self, frame_index: int) -> np.ndarray:
+        return self.last_position + self.velocity * (frame_index - self.last_frame)
+
+    def append(self, detection: dict) -> None:
+        position = np.asarray(detection["reference_anchor"], dtype=np.float64)
+        dt = detection["frame"] - self.last_frame
+        if dt > 0:
+            measured = (position - self.last_position) / dt
+            self.velocity = measured if len(self.observations) == 1 else (
+                0.65 * self.velocity + 0.35 * measured)
+        self.observations.append(detection)
+        self.last_frame = detection["frame"]
+        self.last_position = position
+        self.last_box = detection["reference_bbox_xyxy"]
+        descriptor = detection.get("_appearance")
+        if descriptor is not None:
+            self.appearance = (descriptor.copy() if self.appearance is None else
+                               (0.8 * self.appearance + 0.2 * descriptor).astype(np.float32))
+
+
+def _assignment(cost: np.ndarray) -> list[tuple[int, int]]:
+    if cost.size == 0:
+        return []
+    try:
+        from scipy.optimize import linear_sum_assignment
+        rows, columns = linear_sum_assignment(cost)
+        return [(int(row), int(column)) for row, column in zip(rows, columns)]
+    except ImportError:
+        candidates = sorted(
+            (float(cost[row, column]), row, column)
+            for row in range(cost.shape[0]) for column in range(cost.shape[1]))
+        used_rows = set()
+        used_columns = set()
+        result = []
+        for _, row, column in candidates:
+            if row not in used_rows and column not in used_columns:
+                result.append((row, column))
+                used_rows.add(row)
+                used_columns.add(column)
+        return result
