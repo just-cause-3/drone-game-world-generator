@@ -604,3 +604,110 @@ def _assignment(cost: np.ndarray) -> list[tuple[int, int]]:
                 used_rows.add(row)
                 used_columns.add(column)
         return result
+
+
+class StabilizedTracker:
+    def __init__(self, width: int, height: int, fps: float, options: Stage3Options):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.options = options
+        self.diagonal = math.hypot(width, height)
+        self.next_identifier = 1
+        self.active: list[_Track] = []
+        self.finished: list[_Track] = []
+
+    def _gate(self, kind: str, dt: int) -> float:
+        fraction = (
+            self.options.car_link_diagonal_fraction_per_frame
+            if kind == "car"
+            else self.options.person_link_diagonal_fraction_per_frame)
+        return max(
+            self.options.minimum_link_distance_px,
+            self.diagonal * fraction * max(1, dt))
+
+    @staticmethod
+    def _box_area(box: Iterable[float]) -> float:
+        x1, y1, x2, y2 = box
+        return max(1e-6, (x2 - x1) * (y2 - y1))
+
+    def _associate(self, tracks: list[_Track], detections: list[dict],
+                   frame_index: int) -> tuple[list[tuple[int, int]], set[int], set[int]]:
+        if not tracks or not detections:
+            return [], set(range(len(tracks))), set(range(len(detections)))
+        invalid = 1e6
+        cost = np.full((len(tracks), len(detections)), invalid, dtype=np.float64)
+        for track_index, track in enumerate(tracks):
+            dt = frame_index - track.last_frame
+            gate = self._gate(track.kind, dt)
+            predicted = track.predict(frame_index)
+            old_area = self._box_area(track.last_box)
+            for detection_index, detection in enumerate(detections):
+                if detection["kind"] != track.kind:
+                    continue
+                position = np.asarray(detection["reference_anchor"], dtype=np.float64)
+                distance = float(np.linalg.norm(position - predicted))
+                new_area = self._box_area(detection["reference_bbox_xyxy"])
+                size_ratio = max(old_area, new_area) / min(old_area, new_area)
+                if distance > gate or size_ratio > self.options.maximum_size_ratio:
+                    continue
+                appearance_distance = _appearance_distance(
+                    track.appearance, detection.get("_appearance"))
+                if (appearance_distance is not None and
+                        appearance_distance > self.options.appearance_max_distance):
+                    continue
+                overlap = _iou(track.last_box, detection["reference_bbox_xyxy"])
+                size_penalty = abs(math.log(new_area / old_area))
+                cost[track_index, detection_index] = (
+                    distance / gate + 0.20 * (1.0 - overlap) +
+                    0.10 * size_penalty + self.options.appearance_cost_weight *
+                    (appearance_distance if appearance_distance is not None else 0.0))
+        matches = []
+        for track_index, detection_index in _assignment(cost):
+            if cost[track_index, detection_index] < invalid:
+                matches.append((track_index, detection_index))
+        matched_tracks = {item[0] for item in matches}
+        matched_detections = {item[1] for item in matches}
+        return (
+            matches,
+            set(range(len(tracks))) - matched_tracks,
+            set(range(len(detections))) - matched_detections,
+        )
+
+    def update(self, frame_index: int, detections: list[dict]) -> None:
+        survivors = []
+        for track in self.active:
+            if frame_index - track.last_frame > self.options.max_lost_frames:
+                self.finished.append(track)
+            else:
+                survivors.append(track)
+        self.active = survivors
+
+        high = [detection for detection in detections
+                if detection["confidence"] >= self.options.detector_high_confidence]
+        low = [detection for detection in detections
+               if detection["confidence"] < self.options.detector_high_confidence]
+        matches, unmatched_track_indices, unmatched_high_indices = self._associate(
+            self.active, high, frame_index)
+        for track_index, detection_index in matches:
+            detection = high[detection_index]
+            detection["track_id"] = self.active[track_index].identifier
+            self.active[track_index].append(detection)
+
+        unmatched_tracks = [self.active[index] for index in sorted(unmatched_track_indices)]
+        low_matches, _, _ = self._associate(unmatched_tracks, low, frame_index)
+        for local_track_index, detection_index in low_matches:
+            track = unmatched_tracks[local_track_index]
+            detection = low[detection_index]
+            detection["track_id"] = track.identifier
+            track.append(detection)
+
+        for detection_index in sorted(unmatched_high_indices):
+            detection = high[detection_index]
+            detection["track_id"] = self.next_identifier
+            track = _Track(self.next_identifier, detection)
+            self.next_identifier += 1
+            self.active.append(track)
+
+    def all_tracks(self) -> list[_Track]:
+        return sorted(self.finished + self.active, key=lambda track: track.identifier)
