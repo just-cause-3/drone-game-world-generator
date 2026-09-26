@@ -840,3 +840,377 @@ def _playback_track(track: _Track, fps: float, options: Stage3Options) -> dict:
         "mean_confidence": round(float(np.mean(confidences)), 4),
         "samples": samples,
     }
+
+
+def _color(identifier: int, kind: str) -> tuple[int, int, int]:
+    if kind == "car":
+        base = np.array([255, 155, 45], dtype=np.int32)
+    else:
+        base = np.array([45, 220, 255], dtype=np.int32)
+    shift = np.array([(identifier * 53) % 80, (identifier * 29) % 60, 0])
+    return tuple(int(value) for value in np.clip(base - shift, 40, 255))
+
+
+def _annotate(frame: np.ndarray, detections: list[dict], frame_index: int,
+              fps: float, thickness: int) -> np.ndarray:
+    result = frame.copy()
+    for detection in detections:
+        x1, y1, x2, y2 = (int(round(value)) for value in detection["bbox_xyxy"])
+        identifier = detection.get("track_id")
+        color = _color(int(identifier or 0), detection["kind"])
+        cv2.rectangle(result, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+        identity = f"#{identifier}" if identifier is not None else "unassigned"
+        label = f"{detection['kind']} {identity} {detection['confidence']:.2f}"
+        cv2.putText(result, label, (x1, max(15, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(result, label, (x1, max(15, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    cv2.putText(
+        result, f"frame={frame_index} t={frame_index / fps:.3f}s",
+        (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(
+        result, f"frame={frame_index} t={frame_index / fps:.3f}s",
+        (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    return result
+
+
+def _draw_track_map(ground: np.ndarray, tracks: list[_Track], destination: Path) -> None:
+    image = ground.copy()
+    for track in tracks:
+        points = np.asarray(
+            [item["reference_anchor"] for item in track.observations], dtype=np.float64)
+        if len(points) == 0:
+            continue
+        points_i = np.round(points).astype(np.int32).reshape(-1, 1, 2)
+        color = _color(track.identifier, track.kind)
+        if len(points) > 1:
+            cv2.polylines(image, [points_i], False, color, 2, cv2.LINE_AA)
+        start = tuple(points_i[0, 0])
+        end = tuple(points_i[-1, 0])
+        cv2.circle(image, start, 5, color, -1, cv2.LINE_AA)
+        cv2.drawMarker(image, end, color, cv2.MARKER_TILTED_CROSS, 10, 2)
+        cv2.putText(image, f"{track.kind} #{track.identifier}",
+                    (int(start[0]) + 6, int(start[1]) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, f"{track.kind} #{track.identifier}",
+                    (int(start[0]) + 6, int(start[1]) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    if not cv2.imwrite(str(destination), image):
+        raise IOError(f"could not write track map: {destination}")
+
+
+def _publish_directory(temporary: Path, output: Path) -> None:
+    if output.exists():
+        if not output.is_dir():
+            raise ValueError(f"refusing to replace unrelated output path: {output}")
+        marker = output / OUTPUT_MARKER
+        if any(output.iterdir()) and not marker.is_file():
+            raise ValueError(f"refusing to replace unrelated output directory: {output}")
+        shutil.rmtree(output)
+    temporary.replace(output)
+
+
+def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
+               options: Stage3Options | None = None, detector=None) -> dict:
+    options = options or Stage3Options()
+    options.validate()
+    inputs = _load_inputs(stage1_bundle, stage2_bundle)
+    detector = detector or YoloActorDetector(options)
+    if not hasattr(detector, "detect") or not hasattr(detector, "metadata"):
+        raise TypeError("detector must expose detect(frame, frame_index) and metadata")
+    validate_inputs = getattr(detector, "validate_inputs", None)
+    if validate_inputs is not None:
+        validate_inputs(inputs)
+
+    output = Path(output_directory).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}-", dir=str(output.parent)))
+    capture = None
+    writer = None
+    try:
+        (temporary / OUTPUT_MARKER).write_text(STAGE3_SCHEMA + "\n", encoding="utf-8")
+        capture = cv2.VideoCapture(str(inputs["video_path"]))
+        if not capture.isOpened():
+            raise ValueError("could not reopen Stage 1 CFR video")
+        preview_path = temporary / "tracking_preview.mp4"
+        writer = cv2.VideoWriter(
+            str(preview_path), cv2.VideoWriter_fourcc(*"mp4v"), inputs["fps"],
+            (inputs["width"], inputs["height"]))
+        if not writer.isOpened():
+            raise RuntimeError("OpenCV could not create tracking_preview.mp4")
+
+        tracker = StabilizedTracker(
+            inputs["width"], inputs["height"], inputs["fps"], options)
+        detections_path = temporary / "detections.jsonl"
+        counts_path = temporary / "frame_counts.csv"
+        detection_counts = Counter()
+        high_count = 0
+        total_count = 0
+        assigned_count = 0
+        processed = 0
+        out_of_bounds_count = 0
+        out_of_bounds_detections = []
+        with detections_path.open("w", encoding="utf-8", newline="\n") as detection_file, \
+                counts_path.open("w", encoding="utf-8", newline="") as counts_file:
+            counts_writer = csv.writer(counts_file)
+            counts_writer.writerow([
+                "frame", "time_s", "car_detections", "person_detections",
+                "assigned_detections", "active_tracks",
+            ])
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if processed >= inputs["frame_count"]:
+                    raise ValueError("CFR decoder produced more frames than Stage 1 declares")
+                raw_detections = detector.detect(frame, processed)
+                if not isinstance(raw_detections, list):
+                    raise TypeError("detector.detect must return a list")
+                mapped = []
+                frame_transform = inputs["transforms"][processed]
+                for raw in raw_detections:
+                    kind = str(raw.get("kind", ""))
+                    if kind not in {"car", "person"}:
+                        raise ValueError(f"detector emitted unsupported actor kind: {kind!r}")
+                    score = float(raw["confidence"])
+                    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                        raise ValueError("detector emitted an invalid confidence")
+                    box = [float(value) for value in raw["bbox_xyxy"]]
+                    if len(box) != 4 or not all(math.isfinite(value) for value in box):
+                        raise ValueError("detector emitted an invalid bounding box")
+                    x1, y1, x2, y2 = box
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    source_u = 0.5 * (x1 + x2)
+                    source_v = 0.5 * (y1 + y2)
+                    reference_u, reference_v = _project_point(
+                        frame_transform, source_u, source_v)
+                    reference_box = _transform_box(frame_transform, box)
+                    tolerance_x = inputs["width"] * options.boundary_tolerance_fraction
+                    tolerance_y = inputs["height"] * options.boundary_tolerance_fraction
+                    if not (-tolerance_x <= reference_u <= inputs["width"] - 1 + tolerance_x and
+                            -tolerance_y <= reference_v <= inputs["height"] - 1 + tolerance_y):
+                        out_of_bounds_count += 1
+                        if len(out_of_bounds_detections) < 50:
+                            out_of_bounds_detections.append({
+                                "frame": processed,
+                                "kind": kind,
+                                "reference_anchor": [reference_u, reference_v],
+                            })
+                        continue
+                    # Keep the actor centre on the finite reconstructed ground. The
+                    # small tolerance absorbs sub-pixel registration noise; clamping
+                    # prevents it from becoming an off-plane Unity position.
+                    reference_u = min(max(reference_u, 0.0), inputs["width"] - 1.0)
+                    reference_v = min(max(reference_v, 0.0), inputs["height"] - 1.0)
+                    world_x, world_z = _project_point(
+                        inputs["pixel_to_world"], reference_u, reference_v)
+                    item = {
+                        "frame": processed,
+                        "t": round(processed / inputs["fps"], 6),
+                        "kind": kind,
+                        "detector_class_id": int(raw.get("detector_class_id", -1)),
+                        "detector_class": str(raw.get("detector_class", kind)),
+                        "confidence": score,
+                        "bbox_xyxy": box,
+                        "source_anchor": [source_u, source_v],
+                        "reference_bbox_xyxy": reference_box,
+                        "reference_anchor": [reference_u, reference_v],
+                        "world_anchor": [world_x, world_z],
+                        "inference_passes": list(raw.get("inference_passes", [])),
+                        "_appearance": _appearance_descriptor(frame, box),
+                    }
+                    mapped.append(item)
+                    detection_counts[kind] += 1
+                    total_count += 1
+                    if score >= options.detector_high_confidence:
+                        high_count += 1
+
+                tracker.update(processed, mapped)
+                assigned = sum("track_id" in detection for detection in mapped)
+                assigned_count += assigned
+                for detection in mapped:
+                    serialized = dict(detection)
+                    serialized.pop("_appearance", None)
+                    for key in ("bbox_xyxy", "source_anchor", "reference_bbox_xyxy",
+                                "reference_anchor", "world_anchor"):
+                        serialized[key] = [round(float(value), 6)
+                                           for value in serialized[key]]
+                    serialized["confidence"] = round(serialized["confidence"], 6)
+                    detection_file.write(json.dumps(serialized, separators=(",", ":")) + "\n")
+                counts_writer.writerow([
+                    processed,
+                    f"{processed / inputs['fps']:.6f}",
+                    sum(item["kind"] == "car" for item in mapped),
+                    sum(item["kind"] == "person" for item in mapped),
+                    assigned,
+                    len(tracker.active),
+                ])
+                writer.write(_annotate(
+                    frame, mapped, processed, inputs["fps"],
+                    options.preview_line_thickness))
+                processed += 1
+                if processed % 5 == 0 or processed == inputs["frame_count"]:
+                    log(
+                        "stage3",
+                        f"frames {processed}/{inputs['frame_count']}; "
+                        f"detections={total_count}; tracks_started={tracker.next_identifier - 1}")
+        capture.release()
+        capture = None
+        writer.release()
+        writer = None
+        if processed != inputs["frame_count"]:
+            raise ValueError(
+                f"CFR decoder produced {processed} frames; Stage 1 declares "
+                f"{inputs['frame_count']}")
+
+        all_tracks = tracker.all_tracks()
+        confirmed = [track for track in all_tracks
+                     if len(track.observations) >= options.min_confirmed_observations]
+        confirmed_ids = {track.identifier for track in confirmed}
+        playback_tracks = [
+            _playback_track(track, inputs["fps"], options) for track in confirmed
+        ]
+        tracks_payload = {
+            "schema_version": STAGE3_SCHEMA,
+            "fps": inputs["fps"],
+            "frame_count": inputs["frame_count"],
+            "duration_s": round(inputs["frame_count"] / inputs["fps"], 6),
+            "ground_y": inputs["ground_y"],
+            "scale_confidence": inputs["scale_confidence"],
+            "tracks": playback_tracks,
+        }
+        (temporary / "tracks.json").write_text(
+            json.dumps(tracks_payload, indent=2) + "\n", encoding="utf-8")
+        _draw_track_map(inputs["ground"], confirmed, temporary / "track_map.png")
+
+        preview_info = _video_info(preview_path)
+        failures = []
+        if preview_info["width"] != inputs["width"] or preview_info["height"] != inputs["height"]:
+            failures.append("tracking preview dimensions do not match the CFR video")
+        if preview_info["frame_count"] != inputs["frame_count"]:
+            failures.append("tracking preview frame count does not match the CFR video")
+        if abs(preview_info["fps"] - inputs["fps"]) > max(1e-3, inputs["fps"] * 1e-4):
+            failures.append("tracking preview FPS does not match the CFR video")
+        confirmed_observations = sum(len(track.observations) for track in confirmed)
+        interpolated_samples = sum(
+            sum(not sample["observed"] for sample in track["samples"])
+            for track in playback_tracks)
+        max_speeds = {
+            kind: round(max(
+                (sample["speed_units_per_s"] for track in playback_tracks
+                 if track["kind"] == kind for sample in track["samples"]),
+                default=0.0), 6)
+            for kind in ("car", "person")
+        }
+        warnings = []
+        if not playback_tracks:
+            warnings.append(
+                "No confirmed cars or people were found. This may be correct for an "
+                "empty clip; inspect the preview before accepting it.")
+        if inputs["metric_scale_is_assumed"]:
+            warnings.append(
+                "Stage 2 scale is assumed. Positions are valid in the chosen Unity "
+                "coordinate system, but speeds and dimensions are not physical measurements.")
+        if out_of_bounds_count:
+            warnings.append(
+                f"Excluded {out_of_bounds_count} detection(s) outside the reconstructed "
+                "Stage 1 ground; actors enter and leave playback at the validated "
+                "world boundary.")
+        unconfirmed = len(all_tracks) - len(confirmed)
+        if unconfirmed:
+            warnings.append(
+                f"Discarded {unconfirmed} track fragment(s) with fewer than "
+                f"{options.min_confirmed_observations} observations.")
+
+        report = {
+            "schema_version": STAGE3_SCHEMA,
+            "stage": 3,
+            "pass": not failures,
+            "failure_reasons": failures,
+            "warnings": warnings,
+            "source_stage1": {
+                "bundle_path": str(inputs["stage1_root"]),
+                "report_sha256": _sha256(inputs["stage1_report_path"]),
+                "cfr_video_sha256": inputs["video_sha256"],
+                "frame_transforms_sha256": inputs["transforms_sha256"],
+                "source_video_sha256": inputs["stage1"]["input"].get("sha256"),
+            },
+            "source_stage2": {
+                "bundle_path": str(inputs["stage2_root"]),
+                "calibration_sha256": _sha256(inputs["calibration_path"]),
+                "confidence": inputs["scale_confidence"],
+                "metric_scale_is_assumed": inputs["metric_scale_is_assumed"],
+            },
+            "timeline": {
+                "fps": inputs["fps"],
+                "frame_count": inputs["frame_count"],
+                "duration_s": round(inputs["frame_count"] / inputs["fps"], 6),
+                "clock": "t = CFR frame index / fps",
+            },
+            "detector": detector.metadata,
+            "tracker": {
+                "implementation": "stabilized-reference-plane-association-v1",
+                "association_space": "stage1_reference_image_pixels",
+                "high_low_confidence_association": True,
+                "offline_smoother": "constant_velocity_RTS",
+                "forward_backward_reconciliation": False,
+            },
+            "quality": {
+                "processed_frames": processed,
+                "detections": total_count,
+                "detections_by_kind": dict(sorted(detection_counts.items())),
+                "high_confidence_detections": high_count,
+                "assigned_detections": assigned_count,
+                "assigned_detection_pct": round(
+                    100.0 * assigned_count / total_count, 3) if total_count else 100.0,
+                "started_tracks": len(all_tracks),
+                "confirmed_tracks": len(confirmed),
+                "confirmed_tracks_by_kind": dict(sorted(Counter(
+                    track.kind for track in confirmed).items())),
+                "confirmed_observations": confirmed_observations,
+                "interpolated_samples": interpolated_samples,
+                "discarded_short_tracks": unconfirmed,
+                "max_speed_units_per_s_by_kind": max_speeds,
+                "out_of_bounds_detections": out_of_bounds_count,
+                "out_of_bounds_detections_sample": out_of_bounds_detections,
+            },
+            "coordinates": {
+                "source_detection_space": "CFR frame pixels, top-left origin",
+                "association_space": "Stage 1 reference-image pixels, top-left origin",
+                "output_space": "Unity world X/Z",
+                "ground_y": inputs["ground_y"],
+                "scale_confidence": inputs["scale_confidence"],
+            },
+            "options": asdict(options),
+            "limitations": [
+                "The initial tracker is geometry-aware but has no project-specific ReID model.",
+                "Axis-aligned detector boxes do not directly reveal a stopped actor's heading.",
+                "Detector and tracker accuracy must be measured on held-out footage from the actual camera.",
+            ],
+            "outputs": {
+                "report": "report.json",
+                "detections": "detections.jsonl",
+                "tracks": "tracks.json",
+                "tracking_preview": "tracking_preview.mp4",
+                "track_map": "track_map.png",
+                "frame_counts": "frame_counts.csv",
+            },
+        }
+        (temporary / "report.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _publish_directory(temporary, output)
+        log(
+            "stage3",
+            f"{'PASS' if report['pass'] else 'FAIL'}: {total_count} detections, "
+            f"{len(confirmed)} confirmed tracks -> {output}")
+        return report
+    except Exception:
+        if capture is not None:
+            capture.release()
+        if writer is not None:
+            writer.release()
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
