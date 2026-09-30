@@ -169,6 +169,61 @@ class Stage3TrackingTests(unittest.TestCase):
         self.assertEqual(next_red["track_id"], red["track_id"])
         self.assertEqual(next_blue["track_id"], blue["track_id"])
 
+    def test_end_to_end_tracks_cars_and_people_on_exact_clock(self):
+        stage1, stage2 = self.make_bundles()
+        frames = {}
+        for index in range(10):
+            frames[index] = [
+                detection("car", 25 + 3 * index, 40,
+                          confidence=0.15 if index == 4 else 0.9, size=14),
+                detection("person", 120, 25 + index, 0.8, size=8),
+            ]
+        output = self.root / "stage3"
+        report = run_stage3(
+            stage1, stage2, output,
+            Stage3Options(min_confirmed_observations=3), FakeDetector(frames))
+        self.assertTrue(report["pass"], report["failure_reasons"])
+        self.assertEqual(report["quality"]["detections"], 20)
+        self.assertEqual(report["quality"]["confirmed_tracks"], 2)
+        tracks = json.loads((output / "tracks.json").read_text(encoding="utf-8"))
+        self.assertEqual(tracks["schema_version"], "stage3-tracks-v1")
+        self.assertEqual({track["kind"] for track in tracks["tracks"]}, {"car", "person"})
+        for track in tracks["tracks"]:
+            self.assertEqual(track["samples"][5]["t"], 0.5)
+            self.assertTrue(all(
+                sample["frame"] == index for index, sample in enumerate(track["samples"])))
+        self.assertTrue((output / "tracking_preview.mp4").is_file())
+        self.assertTrue((output / "track_map.png").is_file())
+
+        cached_output = self.root / "stage3_cached"
+        cached_report = run_stage3(
+            stage1, stage2, cached_output,
+            Stage3Options(min_confirmed_observations=3),
+            CachedActorDetector(output))
+        self.assertTrue(cached_report["pass"])
+        self.assertEqual(cached_report["quality"]["detections"], 20)
+        self.assertEqual(cached_report["quality"]["confirmed_tracks"], 2)
+        self.assertTrue(cached_report["detector"]["reused_detections"])
+
+    def test_camera_translation_is_removed_before_association(self):
+        frame_count = 8
+        transforms = np.repeat(np.eye(3)[None, :, :], frame_count, axis=0)
+        for index in range(frame_count):
+            transforms[index, 0, 2] = -4.0 * index
+        stage1, stage2 = self.make_bundles(frame_count=frame_count, transforms=transforms)
+        frames = {
+            index: [detection("car", 50 + 4 * index, 50, 0.9, 12)]
+            for index in range(frame_count)
+        }
+        output = self.root / "stable"
+        report = run_stage3(
+            stage1, stage2, output, Stage3Options(), FakeDetector(frames))
+        self.assertTrue(report["pass"])
+        self.assertEqual(report["quality"]["confirmed_tracks"], 1)
+        track = json.loads((output / "tracks.json").read_text())["tracks"][0]
+        xs = [sample["x"] for sample in track["samples"]]
+        self.assertLess(max(xs) - min(xs), 1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
