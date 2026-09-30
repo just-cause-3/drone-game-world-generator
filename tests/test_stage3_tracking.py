@@ -224,6 +224,40 @@ class Stage3TrackingTests(unittest.TestCase):
         xs = [sample["x"] for sample in track["samples"]]
         self.assertLess(max(xs) - min(xs), 1e-5)
 
+    def test_detection_outside_reconstructed_ground_is_excluded(self):
+        stage1, stage2 = self.make_bundles(frame_count=4)
+        frames = {
+            index: [detection("car", 175, 50, 0.9, 12)]
+            for index in range(4)
+        }
+        output = self.root / "bounded"
+        report = run_stage3(
+            stage1, stage2, output, Stage3Options(), FakeDetector(frames))
+        self.assertTrue(report["pass"])
+        self.assertEqual(report["quality"]["detections"], 0)
+        self.assertEqual(report["quality"]["confirmed_tracks"], 0)
+        self.assertEqual(report["quality"]["out_of_bounds_detections"], 4)
+        tracks = json.loads((output / "tracks.json").read_text())
+        self.assertEqual(tracks["tracks"], [])
+
+    def test_rejects_stale_stage2_binding(self):
+        stage1, stage2 = self.make_bundles()
+        report_path = stage1 / "report.json"
+        report = json.loads(report_path.read_text())
+        report["reference"]["video_frame"] = 0
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            run_stage3(stage1, stage2, self.root / "out", detector=FakeDetector({}))
+
+    def test_refuses_to_replace_unrelated_output_directory(self):
+        stage1, stage2 = self.make_bundles(frame_count=4)
+        output = self.root / "unrelated"
+        output.mkdir()
+        (output / "important.txt").write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unrelated"):
+            run_stage3(stage1, stage2, output, detector=FakeDetector({}))
+        self.assertEqual((output / "important.txt").read_text(), "keep")
+
 
 if __name__ == "__main__":
     unittest.main()
