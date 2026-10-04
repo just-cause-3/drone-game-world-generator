@@ -6,6 +6,6 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
-    path: Assets/Scenes/Stage1AwaitingValidInput.unity
-    guid: 987c863fe752f6043b6f152078f48ca9
+    path: Assets/Scenes/Stage3ActorPlayback.unity
+    guid: 8a8ac16ba2474214798f65728e43ef62
   m_configObjects: {}
