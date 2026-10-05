@@ -389,3 +389,159 @@ mixed bundles from being imported.
 
 The default output directories can safely be reused by their own stage. Publication is
 atomic and a stage refuses to replace an unrelated non-empty directory.
+
+## 9. Optional PowerShell commands
+
+The Unity windows are recommended for beginners because they run Python, import only a
+passing result, and create the correct scene automatically. The equivalent Python
+commands are useful for diagnostics.
+
+Run Stage 1 without importing it into Unity:
+
+```powershell
+.\.venv\Scripts\python.exe stage1.py "sample_vids\your_video.mp4" --output stage1_out
+```
+
+Run Stage 2 using a control-points file already produced by the Unity Stage 2 window:
+
+```powershell
+.\.venv\Scripts\python.exe stage2.py stage1_out stage1_out\stage2_control_points.json --output stage2_out
+```
+
+Run Stage 3 without importing it into Unity:
+
+```powershell
+.\.venv\Scripts\python.exe stage3.py stage1_out stage2_out --output stage3_out
+```
+
+After one complete Stage 3 detector pass, reapply current tracker/boundary settings
+without repeating YOLO inference:
+
+```powershell
+.\.venv\Scripts\python.exe stage3.py stage1_out stage2_out --output stage3_out --reuse-detections-from stage3_out
+```
+
+The reuse command still validates all upstream hashes and decodes the frames again for
+appearance and diagnostic generation. It skips only the expensive detector inference.
+
+Python exit codes are:
+
+- `0`: success and passing quality gate;
+- `1`: setup, input, or processing error;
+- `2`: completed processing but rejected by the stage's quality gate.
+
+## 10. Troubleshooting
+
+### Unity Hub says there is no project
+
+Add this exact folder from disk:
+
+```text
+<repository>\UnityProject\DroneWorldRecreation
+```
+
+It must directly contain `Assets`, `Packages`, and `ProjectSettings`.
+
+### Unity opens but the scene looks empty
+
+That is expected before Stage 1 passes. Wait for compilation, then use
+**Drone World → Run Stage 1 Pipeline...**. The stage creates and opens its scene.
+
+### The Drone World menu is missing
+
+Wait for script compilation to finish and open **Window → General → Console**. Resolve
+any red C# compilation errors first. Confirm that the project was opened with Unity
+`6000.5.7f1` and that the exact project folder was selected.
+
+### Unity reports that `.venv` or Python is missing
+
+Create `.venv` at the repository root, not inside the Unity project. Do not move
+`UnityProject/DroneWorldRecreation` away from the repository.
+
+### `ffmpeg` or `ffprobe` is not recognized
+
+Install FFmpeg, close every PowerShell/terminal window, open a new one, and repeat the
+version checks from section 2.2.
+
+### The drone model is missing or has the wrong hash
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe setup_drone_model.py --verify-only
+```
+
+If verification fails, redownload the pinned file:
+
+```powershell
+.\.venv\Scripts\python.exe setup_drone_model.py --force
+```
+
+### CUDA is unavailable
+
+The pipeline falls back to CPU. To restore GPU execution, update the NVIDIA driver and
+install a PyTorch CUDA build compatible with that driver. Verify with section 3.4.
+
+### Stage 1 rejects a clip
+
+Open `stage1_out/report.json` and read `failure_reasons`. Typical causes are a cut,
+sudden zoom, excessive translation/rotation, insufficient overlap, blur, or failed
+registration. Use a shorter, steadier, more top-down continuous shot.
+
+### Stage 2 says control points have duplicate world coordinates
+
+Clicked pixel locations are not world measurements. Either enable approximate automatic
+scale, or enter a distinct measured `X/Z` location for every landmark. Only one point
+may use `(0, 0)`.
+
+### Stage 2 passes with RMSE 0 but says the scale is approximate
+
+This is expected in approximate mode. The generated image-corner mapping fits itself
+exactly, but no real measurement was supplied. Treat positions and speeds as Unity
+units, not verified metres.
+
+### Stage 3 appears stuck
+
+Check the pipeline log. Progress lines such as `frames 125/240` mean it is working.
+Full-frame plus tiled TTA intentionally favors accuracy over speed. Stage 3 processes
+every video frame, so longer footage takes proportionally longer.
+
+### Stage 3 import says the bundle is stale
+
+One of the upstream Stage 1/2 files changed after Stage 3 was generated. Re-run the
+stages in order. Do not edit generated JSON or image artifacts manually.
+
+### Unity reports that scene setup cannot run during Play Mode
+
+Exit Play Mode, run the menu command, save the scene if prompted, and then enter Play
+Mode again.
+
+## 11. Final acceptance checklist
+
+Before treating a run as successful, verify all of the following:
+
+- `stage1_out/report.json` has `"pass": true`.
+- `stage1_out/ground.png` is aligned and does not visibly bake moving actors into the
+  ground.
+- `stage2_out/world_calibration.json` has `"pass": true`.
+- `calibration_overlay.png` matches the intended ground orientation and size.
+- If approximate Stage 2 was used, nobody claims the output is physically metric.
+- `stage3_out/report.json` has `"pass": true`.
+- `tracking_preview.mp4` detects the intended cars and people.
+- `track_map.png` has plausible, continuous paths without identity teleports.
+- `Stage3ActorPlayback.unity` enters Play Mode without Console errors.
+- Cars and people move on the ground at the correct video timing.
+
+## 12. Licensing before distribution
+
+Local setup and testing do not remove distribution obligations. The pinned VisDrone
+checkpoint and the Ultralytics implementation used by this project are AGPL-3.0
+licensed. Review the model, code, and eventual product distribution requirements before
+shipping a Unity build or service.
+
+For implementation details and quality contracts, see:
+
+- [`STAGE1_CONTRACT.md`](STAGE1_CONTRACT.md)
+- [`STAGE2_CONTRACT.md`](STAGE2_CONTRACT.md)
+- [`STAGE3_CONTRACT.md`](STAGE3_CONTRACT.md)
+- [`STAGE3_IMPLEMENTATION_PLAN.md`](STAGE3_IMPLEMENTATION_PLAN.md)
