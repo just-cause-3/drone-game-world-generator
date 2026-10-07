@@ -1,9 +1,14 @@
 # Drone Video → Unity Recreation Pipeline
 
-> **Staged rebuild in progress:** the older end-to-end pipeline below is retained as
-> reference. New work starts with a deliberately narrower, testable contract: a
-> stationary or gently drifting, top-down drone video with bounded zoom must produce a validated
-> static ground image. Unity integration will be rebuilt only after this stage is solid.
+> **New user? Start here:** follow
+> [`docs/HOW_TO_RUN.md`](docs/HOW_TO_RUN.md) for the complete one-time setup and the
+> current Stage 1 → Stage 2 → Stage 3 Unity workflow. The long legacy guide later in
+> this README is reference material for the reverted implementation.
+
+> **Staged rebuild status:** Stage 1 static-ground reconstruction, Stage 2 coordinate
+> calibration, and Stage 3 car/person playback are implemented in the clean Unity
+> project. Building/depth generation remains Stage 4. The older end-to-end pipeline
+> below is retained only as reference.
 
 ## New Stage 1 — top-down video to validated ground
 
@@ -63,6 +68,65 @@ Run the focused tests with:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## New Stage 2 — metric world calibration
+
+Stage 2 converts the accepted Stage 1 reference image from pixels into Unity `X/Z`
+coordinates. It supports an explicitly approximate complete-image width when no
+measurements exist. For verified metres, supply at least four non-collinear
+ground-control points; six or more well-distributed surveyed points are recommended:
+
+```powershell
+.venv\Scripts\python.exe stage2.py stage1_out docs\STAGE2_CONTROL_POINTS.example.json --output stage2_out
+```
+
+The example coordinates are illustrative and must be replaced with measurements for
+the actual location. The result is `stage2_out/world_calibration.json` plus a labelled
+`calibration_overlay.png`. Stage 2 rejects clustered points, high reprojection error,
+folding/singular transforms, implausible local distortion, failed Stage 1 inputs, and
+calibrations whose source hashes no longer match.
+
+The artifact and quality gate are documented in
+[`docs/STAGE2_CONTRACT.md`](docs/STAGE2_CONTRACT.md).
+
+## New Stage 3 — real car and pedestrian playback
+
+Stage 3 now consumes the exact passing Stage 1 and Stage 2 bundles:
+
+```powershell
+.venv\Scripts\python.exe stage3.py stage1_out stage2_out --output stage3_out
+```
+
+After one full detector run, tracker-only tuning can reuse the strictly
+provenance-checked detections with `--reuse-detections-from stage3_out`.
+
+It runs the pinned aerial car/person detector on every CFR frame, transforms detections
+into the stabilized Stage 1 reference plane before identity association, maps confirmed
+tracks through Stage 2, derives an exact frame clock, smooths short trajectories, and
+writes review video/map artifacts plus `tracks.json`.
+
+In Unity, use **Drone World -> Stage 3 -> Run Stage 3 Tracking Pipeline...**. A passing
+bundle creates `Assets/Scenes/Stage3ActorPlayback.unity`; press Play to replay the real
+tracks with the sample car/person prefabs. Select the playback root for Inspector
+Play/Pause, Reset, and timeline seeking controls. The artifact contract is documented in
+[`docs/STAGE3_CONTRACT.md`](docs/STAGE3_CONTRACT.md), while the research and improvement
+roadmap remains in
+[`docs/STAGE3_IMPLEMENTATION_PLAN.md`](docs/STAGE3_IMPLEMENTATION_PLAN.md).
+
+## Staged roadmap
+
+1. **Stage 1 — static ground:** validate the fixed top-down video, normalize camera
+   motion/zoom, remove cars and pedestrians, and reconstruct the clean reference plate.
+2. **Stage 2 — metric calibration:** map reference pixels to Unity `X/Z` metres and
+   validate the transform against measured ground-control points.
+3. **Stage 3 — car and pedestrian mapping:** detect on the Stage 1 CFR video, maintain
+   persistent identities, transform every trajectory through the Stage 1 frame geometry
+   and Stage 2 calibration, estimate direction/speed, and emit metric Unity playback.
+   Trucks and other classes remain excluded under the current project policy.
+4. **Stage 4 — static scene understanding and 3D geometry:** classify roads, pavements,
+   markings, vegetation, and structures, then build appropriate Unity geometry.
+5. **Stage 5 — integration and validation:** combine the metric static world and dynamic
+   tracks, then verify timing, placement, scale, collisions, and playback behavior.
 
 ## Legacy pipeline documentation (reference only)
 
