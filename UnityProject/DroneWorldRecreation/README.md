@@ -2,6 +2,9 @@
 
 Open this folder with Unity `6000.5.7f1`.
 
+New users should follow [`../../docs/HOW_TO_RUN.md`](../../docs/HOW_TO_RUN.md) from the
+repository root for installation and the complete Stage 1 → Stage 3 procedure.
+
 This is the clean Unity project for the staged rebuild. It deliberately does not reuse
 the assets, coordinate conversions, tracks, or scenes from `UnityProject/My project`.
 
@@ -25,10 +28,70 @@ The lower-level **Import Passing Stage 1 Bundle...** menu remains available for 
 an already-created bundle without rerunning computer vision.
 
 The preview surface preserves the Stage 1 top-left pixel convention but uses a temporary
-10-unit width. Those units are explicitly not meters. The next stage will replace this
-preview scale using `world_calibration.json` and at least four ground control points.
+10-unit width. Those units are explicitly not meters. Stage 2 replaces this preview
+scale using either measured ground-control points or an explicitly assumed image width.
 
 Failed Stage 1 reports are rejected and cannot replace the preview scene.
+
+## Stage 2 workflow
+
+1. Import a passing Stage 1 bundle.
+2. Select **Drone World → Run Stage 2 Metric Calibration...**.
+3. Click fixed landmarks on the clean reference image.
+4. For every clicked point, enter its measured Unity `X/Z` coordinate in metres.
+5. Use at least four non-collinear points; six or more spread around the image are
+   recommended.
+6. Press **Validate Calibration and Build Metric Scene**.
+
+Python validates point coverage, reprojection error, projective stability, local
+distortion, and Stage 1 provenance. Unity imports only a passing calibration, replaces
+the arbitrary preview plane with a metric four-corner mesh, adds a mesh collider, and
+creates `Assets/Scenes/Stage2MetricWorld.unity`.
+
+Inspect `stage2_out/calibration_overlay.png` before accepting the calibration. Four
+points solve the transform but cannot independently validate measurement error, so a
+four-point result is explicitly labelled `minimum_unverified`.
+
+If no measurements are available, leave **Use approximate automatic scale** enabled,
+choose a convenient complete-image width, and build the scene without clicking any
+landmarks. Unity preserves the image aspect ratio and marks the calibration as assumed;
+later distances and playback speeds are therefore approximate.
+
+## Optional Stage 3 sample actors
+
+The real Stage 3 tracking pipeline is implemented below. Two dependency-free placeholder
+prefabs are also available for testing visuals without running detection:
+
+1. Select **Drone World -> Stage 3 -> Create Sample Actor Prefabs**.
+2. Select **Drone World -> Stage 3 -> Place Sample Actors In Current Scene**.
+3. Press the Unity **Play** button. The car follows an oval path and the person follows
+   a smaller figure-eight path with their heading aligned to movement.
+4. Save the scene if you want to retain the samples.
+
+The first command generates a 4.2 x 1.8 x 1.5 unit car and a 1.75 unit person under
+`Assets/DroneWorld/Stage3/Prefabs`. The second places one of each on the current Stage 2
+ground. Both roots have a ground-level pivot, a collider, and local `+Z` forward. They
+are intentionally lightweight playback/collision stand-ins, not final art or measured
+individual actor dimensions.
+
+If the actors were already placed before playback was added, run **Place Sample Actors
+In Current Scene** again. It upgrades the existing root instead of creating duplicates.
+
+## Stage 3 real tracking workflow
+
+1. Open the Stage 2 metric scene.
+2. Select **Drone World -> Stage 3 -> Run Stage 3 Tracking Pipeline...**.
+3. Confirm the Stage 2 calibration and `stage3_out` artifact folder.
+4. Press **Run Stage 3**. Detection runs on every CFR frame and can take several minutes.
+5. A passing bundle creates and opens `Assets/Scenes/Stage3ActorPlayback.unity`.
+6. Inspect the external `tracking_preview.mp4` and `track_map.png`.
+7. Press Unity **Play** to replay the detected car and person trajectories. Select
+   **Stage 3 Real Track Playback** in the Hierarchy to use the Inspector Play/Pause,
+   Reset, and timeline controls while in Play Mode.
+
+The Stage 3 importer rechecks the Stage 1 report, CFR video, transform-stack, and Stage
+2 calibration hashes before modifying Unity. A failed or stale bundle leaves the
+previous scene unchanged.
 
 The editor integration has a batch-mode self-test (`DroneWorld.Stage1.Editor.Stage1UnitySelfTest.Run`)
 that imports a temporary passing fixture, verifies the mesh/UV convention, then removes
