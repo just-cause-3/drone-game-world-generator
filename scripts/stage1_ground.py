@@ -25,6 +25,11 @@ import cv2
 import numpy as np
 
 from .common import log
+from setup_inpainting_model import (
+    MODEL_PATH as DEFAULT_INPAINT_MODEL,
+    MODEL_SHA256 as INPAINT_MODEL_SHA256,
+    verify as verify_inpaint_model,
+)
 
 
 SCHEMA_VERSION = "stage1-ground-v1"
@@ -47,6 +52,7 @@ SUPPORTED_FOREGROUND_CLASS_NAMES = (
 LIMITATIONS = [
     "Image registration verifies stability but cannot prove that the camera is top-down.",
     "The VisDrone detector can still miss extremely small, occluded, blurred, or domain-specific actors; inspect the masks and ground image.",
+    "Pixels completed by the learned inpainting model are plausible synthesized background, not observed ground truth; inspect learned_inpaint_mask.png.",
     "Stage 1 does not infer metric scale, terrain height, object height, or Unity geometry.",
 ]
 
@@ -81,7 +87,11 @@ class Stage1Options:
     foreground_model: str | None = DEFAULT_FOREGROUND_MODEL
     foreground_imgsz: int = 1280
     foreground_conf: float = 0.08
+    foreground_car_conf: float = 0.12
+    foreground_pedestrian_conf: float = 0.40
     residual_foreground_conf: float = 0.25
+    residual_foreground_car_conf: float = 0.25
+    residual_foreground_pedestrian_conf: float = 0.60
     foreground_iou: float = 0.45
     foreground_max_det: int = 3000
     foreground_class_names: tuple[str, ...] = SUPPORTED_FOREGROUND_CLASS_NAMES
@@ -95,7 +105,10 @@ class Stage1Options:
     min_semantic_consensus_frames: int = 2
     inpaint_radius_px: float = 5.0
     max_inpaint_component_pct: float = 0.75
-    max_inpainted_pct: float = 2.0
+    learned_inpaint_model: str | None = str(DEFAULT_INPAINT_MODEL).replace("\\", "/")
+    max_learned_inpaint_component_pct: float = 8.0
+    learned_inpaint_context_scale: float = 1.5
+    max_inpainted_pct: float = 10.0
     max_unresolved_hole_pct: float = 0.10
     max_residual_foreground_detections: int = 0
     residual_repair_passes: int = 2
@@ -129,8 +142,21 @@ class Stage1Options:
             raise ValueError("foreground_imgsz must be at least 320")
         if not 0 < self.foreground_conf < 1:
             raise ValueError("foreground_conf must be in (0, 1)")
+        if not self.foreground_conf <= self.foreground_car_conf < 1:
+            raise ValueError("foreground_car_conf must be in [foreground_conf, 1)")
+        if not self.foreground_conf <= self.foreground_pedestrian_conf < 1:
+            raise ValueError(
+                "foreground_pedestrian_conf must be in [foreground_conf, 1)")
         if not 0 < self.residual_foreground_conf < 1:
             raise ValueError("residual_foreground_conf must be in (0, 1)")
+        if not self.residual_foreground_conf <= self.residual_foreground_car_conf < 1:
+            raise ValueError(
+                "residual_foreground_car_conf must be in [residual_foreground_conf, 1)")
+        if not self.residual_foreground_conf <= \
+                self.residual_foreground_pedestrian_conf < 1:
+            raise ValueError(
+                "residual_foreground_pedestrian_conf must be in "
+                "[residual_foreground_conf, 1)")
         if not 0 < self.foreground_iou < 1:
             raise ValueError("foreground_iou must be in (0, 1)")
         if self.foreground_max_det < 1:
@@ -149,6 +175,12 @@ class Stage1Options:
             raise ValueError("min_semantic_consensus_frames must be at least 1")
         if self.max_inpaint_component_pct < 0:
             raise ValueError("max_inpaint_component_pct cannot be negative")
+        if self.max_learned_inpaint_component_pct < 0:
+            raise ValueError("max_learned_inpaint_component_pct cannot be negative")
+        if self.learned_inpaint_context_scale < 0:
+            raise ValueError("learned_inpaint_context_scale cannot be negative")
+        if not 0 <= self.max_inpainted_pct <= 100:
+            raise ValueError("max_inpainted_pct must be in [0, 100]")
         if self.residual_repair_passes < 0:
             raise ValueError("residual_repair_passes cannot be negative")
 
@@ -332,7 +364,17 @@ class _YoloForegroundMasker:
             "model_classes": self.model_names,
             "selected_classes": sorted(self.selected_names),
             "confidence": self.options.foreground_conf,
+            "class_confidence": {
+                "car": self.options.foreground_car_conf,
+                "pedestrian": self.options.foreground_pedestrian_conf,
+                "people": self.options.foreground_pedestrian_conf,
+            },
             "residual_confidence": self.options.residual_foreground_conf,
+            "residual_class_confidence": {
+                "car": self.options.residual_foreground_car_conf,
+                "pedestrian": self.options.residual_foreground_pedestrian_conf,
+                "people": self.options.residual_foreground_pedestrian_conf,
+            },
             "iou": self.options.foreground_iou,
             "imgsz": self.options.foreground_imgsz,
             "full_frame": self.options.foreground_full_frame,
@@ -370,7 +412,8 @@ class _YoloForegroundMasker:
             })
         return candidates
 
-    def mask(self, frame: np.ndarray, confidence: float | None = None):
+    def mask(self, frame: np.ndarray, confidence: float | None = None,
+             residual_audit: bool = False):
         height, width = frame.shape[:2]
         confidence = self.options.foreground_conf if confidence is None else confidence
         candidates = []
@@ -397,6 +440,19 @@ class _YoloForegroundMasker:
         mask = np.zeros(frame.shape[:2], np.uint8)
         detections = []
         for candidate in merged:
+            normalized_name = _normalized_class_name(candidate["class"])
+            if residual_audit:
+                class_confidence = (
+                    self.options.residual_foreground_car_conf
+                    if normalized_name == "car"
+                    else self.options.residual_foreground_pedestrian_conf)
+            else:
+                class_confidence = (
+                    self.options.foreground_car_conf
+                    if normalized_name == "car"
+                    else self.options.foreground_pedestrian_conf)
+            if candidate["confidence"] < max(confidence, class_confidence):
+                continue
             x1, y1, x2, y2 = candidate["bbox_xyxy"]
             pad_x = (x2 - x1) * self.options.foreground_box_padding_fraction
             pad_y = (y2 - y1) * self.options.foreground_box_padding_fraction
@@ -457,6 +513,93 @@ def _inpaint_small_holes(image: np.ndarray, holes: np.ndarray,
         repaired = cv2.inpaint(image, eligible, options.inpaint_radius_px, cv2.INPAINT_TELEA)
     unresolved = holes & (eligible == 0)
     return repaired, eligible, unresolved
+
+
+class _LamaInpainter:
+    """Pinned OpenCV-DNN LaMa inference with component-local high-res context."""
+
+    def __init__(self, options: Stage1Options):
+        requested = Path(str(options.learned_inpaint_model))
+        repository_model = Path(__file__).resolve().parents[1] / requested
+        model_path = (repository_model if not requested.is_absolute() and
+                      repository_model.exists() else requested)
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"Stage 1 LaMa model is missing: {model_path}. Run "
+                "'.venv\\Scripts\\python.exe setup_inpainting_model.py' once.")
+        verify_inpaint_model(model_path)
+        self.model_path = model_path.resolve()
+        self.net = cv2.dnn.readNetFromONNX(str(self.model_path))
+        self.context_scale = options.learned_inpaint_context_scale
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "implementation": "opencv-dnn-lama-component-v1",
+            "model": str(self.model_path),
+            "model_sha256": INPAINT_MODEL_SHA256,
+            "input_size": [512, 512],
+        }
+
+    def _infer_crop(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        image_blob = cv2.dnn.blobFromImage(
+            image, 1.0 / 255.0, (512, 512), (0, 0, 0), False, False)
+        mask_blob = cv2.dnn.blobFromImage(
+            mask, 1.0, (512, 512), (0,), False, False)
+        mask_blob = (mask_blob > 0).astype(np.float32)
+        self.net.setInput(image_blob, "image")
+        self.net.setInput(mask_blob, "mask")
+        output = self.net.forward()[0]
+        result = np.transpose(output, (1, 2, 0))
+        if not np.all(np.isfinite(result)):
+            raise RuntimeError("LaMa produced non-finite pixels")
+        result = np.clip(result, 0, 255).astype(np.uint8)
+        return cv2.resize(
+            result, (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_LANCZOS4)
+
+    def inpaint(self, image: np.ndarray, holes: np.ndarray,
+                maximum_component_pct: float):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            holes.astype(np.uint8), 8)
+        repaired = image.copy()
+        learned_mask = np.zeros_like(holes, np.uint8)
+        max_area = image.shape[0] * image.shape[1] * maximum_component_pct / 100.0
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area > max_area:
+                continue
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            width = int(stats[label, cv2.CC_STAT_WIDTH])
+            height = int(stats[label, cv2.CC_STAT_HEIGHT])
+            margin = max(48, int(round(max(width, height) * self.context_scale)))
+            x0 = max(0, x - margin)
+            y0 = max(0, y - margin)
+            x1 = min(image.shape[1], x + width + margin)
+            y1 = min(image.shape[0], y + height + margin)
+            component = (labels[y0:y1, x0:x1] == label).astype(np.uint8) * 255
+            prediction = self._infer_crop(repaired[y0:y1, x0:x1], component)
+            region = repaired[y0:y1, x0:x1]
+            region[component > 0] = prediction[component > 0]
+            repaired[y0:y1, x0:x1] = region
+            learned_mask[y0:y1, x0:x1] = np.maximum(
+                learned_mask[y0:y1, x0:x1], component)
+        unresolved = holes & (learned_mask == 0)
+        return repaired, learned_mask, unresolved
+
+
+def _repair_foreground_holes(image: np.ndarray, holes: np.ndarray,
+                             options: Stage1Options,
+                             inpainter: _LamaInpainter | None):
+    repaired, classical_mask, unresolved = _inpaint_small_holes(
+        image, holes, options)
+    learned_mask = np.zeros_like(classical_mask)
+    if inpainter is not None and np.any(unresolved):
+        repaired, learned_mask, unresolved = inpainter.inpaint(
+            repaired, unresolved, options.max_learned_inpaint_component_pct)
+    combined = np.maximum(classical_mask, learned_mask)
+    return repaired, combined, learned_mask, unresolved
 
 
 def _semantic_exclusion(foreground: np.ndarray, accepted: np.ndarray,
@@ -853,6 +996,9 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         reference = np.asarray(frames[reference_slot]).copy()
         reference_features = _features(reference, options)
         masker = _YoloForegroundMasker(options) if options.foreground_model else None
+        # The 92 MB ONNX graph is expensive to parse; load it only when temporal
+        # reconstruction actually leaves a component too large for classical repair.
+        inpainter = None
         transforms = np.full((len(indices), 3, 3), np.nan, np.float64)
         accepted = np.zeros(len(indices), bool)
         registrations = []
@@ -961,6 +1107,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             "reference_foreground_mask": "reference_foreground_mask.png",
             "semantic_exclusion": "semantic_exclusion_mask.png",
             "inpaint_mask": "inpaint_mask.png",
+            "learned_inpaint_mask": "learned_inpaint_mask.png",
             "sample_transforms": "sample_transforms_to_reference.npy",
             "frame_transforms": "frame_transforms_to_reference.npy",
             "registration": "registration.json",
@@ -992,6 +1139,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         residual_detections = []
         residual_detections_before_repair = []
         residual_repair_pct = 0.0
+        learned_inpainted_pct = 0.0
         minimum_observations = 0
         if registered >= 3:
             frame_transforms = _interpolate_frame_transforms(
@@ -1000,38 +1148,51 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             (ground, heat, holes, frequency, semantic_exclusion,
              minimum_observations, semantic_consensus_frames) = _build_background(
                 frames, valid, foreground, accepted, options)
-            repaired, inpaint_mask, unresolved = _inpaint_small_holes(
-                ground[:, :, :3], holes, options)
+            if np.any(holes) and options.learned_inpaint_model:
+                inpainter = _LamaInpainter(options)
+            repaired, inpaint_mask, learned_inpaint_mask, unresolved = \
+                _repair_foreground_holes(
+                    ground[:, :, :3], holes, options, inpainter)
             ground[:, :, :3] = repaired
             ground[unresolved, 3] = 0
             foreground_observation_pct = 100.0 * float(np.mean(frequency))
             semantic_exclusion_pct = 100.0 * float(np.mean(semantic_exclusion))
             if masker:
                 residual_mask, residual_detections = masker.mask(
-                    ground[:, :, :3], options.residual_foreground_conf)
+                    ground[:, :, :3], options.residual_foreground_conf,
+                    residual_audit=True)
                 residual_detections_before_repair = list(residual_detections)
                 residual_repair_mask = np.zeros_like(residual_mask)
                 for _ in range(options.residual_repair_passes):
                     if not residual_detections:
                         break
-                    repaired, eligible, residual_unresolved = _inpaint_small_holes(
-                        ground[:, :, :3], residual_mask > 0, options)
+                    if inpainter is None and options.learned_inpaint_model:
+                        inpainter = _LamaInpainter(options)
+                    repaired, eligible, learned_eligible, residual_unresolved = \
+                        _repair_foreground_holes(
+                            ground[:, :, :3], residual_mask > 0,
+                            options, inpainter)
                     if not np.any(eligible):
                         unresolved |= residual_unresolved
                         break
                     ground[:, :, :3] = repaired
                     residual_repair_mask = np.maximum(residual_repair_mask, eligible)
                     inpaint_mask = np.maximum(inpaint_mask, eligible)
+                    learned_inpaint_mask = np.maximum(
+                        learned_inpaint_mask, learned_eligible)
                     unresolved |= residual_unresolved
                     ground[unresolved, 3] = 0
                     residual_mask, residual_detections = masker.mask(
-                        ground[:, :, :3], options.residual_foreground_conf)
+                        ground[:, :, :3], options.residual_foreground_conf,
+                        residual_audit=True)
                 residual_repair_pct = 100.0 * float(
                     np.mean(residual_repair_mask > 0))
 
             coverage = ground[:, :, 3] > 0
             coverage_pct = 100.0 * float(np.mean(coverage))
             inpainted_pct = 100.0 * float(np.mean(inpaint_mask > 0))
+            learned_inpainted_pct = 100.0 * float(
+                np.mean(learned_inpaint_mask > 0))
             unresolved_pct = 100.0 * float(np.mean(unresolved))
 
             _write_image(result_dir / final_names["ground"], ground)
@@ -1045,6 +1206,9 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             _write_image(result_dir / final_names["semantic_exclusion"],
                          semantic_exclusion.astype(np.uint8) * 255)
             _write_image(result_dir / final_names["inpaint_mask"], inpaint_mask)
+            _write_image(
+                result_dir / final_names["learned_inpaint_mask"],
+                learned_inpaint_mask)
 
             if coverage_pct < options.min_output_coverage_pct:
                 failures.append(f"output coverage {coverage_pct:.1f}% < "
@@ -1091,6 +1255,9 @@ def _run_stage1(video, output_dir, options: Stage1Options):
                 "time_s": round(float(indices[reference_slot] / fps), 4),
             },
             "detector": masker.metadata if masker else {"enabled": False},
+            "inpainting": (
+                inpainter.metadata if inpainter else
+                {"implementation": "opencv-telea-small-components-only"}),
             "quality": {
                 "sampled_frames": len(indices),
                 "registered_frames": registered,
@@ -1121,6 +1288,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
                 "semantic_exclusion_area_pct": round(semantic_exclusion_pct, 4),
                 "semantic_consensus_frames": semantic_consensus_frames,
                 "inpainted_area_pct": round(inpainted_pct, 4),
+                "learned_inpainted_area_pct": round(learned_inpainted_pct, 4),
                 "unresolved_foreground_hole_pct": round(unresolved_pct, 4),
                 "residual_detections_before_repair": residual_detections_before_repair,
                 "residual_repair_area_pct": round(residual_repair_pct, 4),
