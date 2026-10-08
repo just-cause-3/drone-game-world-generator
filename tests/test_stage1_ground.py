@@ -8,11 +8,13 @@ import numpy as np
 
 from scripts.stage1_ground import (
     Stage1Options,
+    _YoloForegroundMasker,
     _class_agnostic_nms,
     _build_background,
     _frame_geometry_audit,
     _inpaint_small_holes,
     _registration,
+    _repair_foreground_holes,
     _semantic_exclusion,
     _tile_origins,
     run_stage1,
@@ -33,6 +35,65 @@ def _synthetic_world(width=320, height=240):
 
 
 class Stage1GroundTests(unittest.TestCase):
+    def test_stage1_uses_class_specific_precision_thresholds(self):
+        options = Stage1Options(
+            foreground_model="fixture.pt", foreground_full_frame=True,
+            foreground_tile_size=0, foreground_dilate_px=0,
+            foreground_car_conf=0.12, foreground_pedestrian_conf=0.40)
+        masker = object.__new__(_YoloForegroundMasker)
+        masker.options = options
+        masker._predict = lambda *args: [
+            {"bbox_xyxy": [5, 5, 15, 15], "confidence": 0.30,
+             "class_id": 3, "class": "car", "inference_pass": "full"},
+            {"bbox_xyxy": [25, 5, 35, 15], "confidence": 0.30,
+             "class_id": 0, "class": "pedestrian", "inference_pass": "full"},
+            {"bbox_xyxy": [45, 5, 55, 15], "confidence": 0.50,
+             "class_id": 0, "class": "pedestrian", "inference_pass": "full"},
+        ]
+
+        mask, detections = masker.mask(np.zeros((64, 64, 3), np.uint8))
+
+        self.assertEqual({"car", "pedestrian"},
+                         {item["class"] for item in detections})
+        self.assertEqual(0, int(mask[10, 30]))
+        self.assertEqual(255, int(mask[10, 10]))
+        self.assertEqual(255, int(mask[10, 50]))
+
+        residual_mask, residual = masker.mask(
+            np.zeros((64, 64, 3), np.uint8),
+            options.residual_foreground_conf,
+            residual_audit=True,
+        )
+        self.assertEqual(["car"], [item["class"] for item in residual])
+        self.assertEqual(255, int(residual_mask[10, 10]))
+        self.assertEqual(0, int(residual_mask[10, 50]))
+
+    def test_large_hole_falls_back_to_learned_inpainter(self):
+        image = np.full((100, 100, 3), 100, np.uint8)
+        holes = np.zeros((100, 100), bool)
+        holes[20:80, 20:80] = True
+        options = Stage1Options(
+            foreground_model=None, max_inpaint_component_pct=1.0,
+            max_learned_inpaint_component_pct=50.0)
+
+        class FixtureInpainter:
+            def inpaint(self, source, remaining, maximum_component_pct):
+                self.maximum = maximum_component_pct
+                result = source.copy()
+                result[remaining] = 175
+                mask = remaining.astype(np.uint8) * 255
+                return result, mask, np.zeros_like(remaining)
+
+        fixture = FixtureInpainter()
+        repaired, combined, learned, unresolved = _repair_foreground_holes(
+            image, holes, options, fixture)
+
+        self.assertEqual(50.0, fixture.maximum)
+        self.assertFalse(np.any(unresolved))
+        self.assertEqual(3600, int(np.count_nonzero(learned)))
+        self.assertEqual(3600, int(np.count_nonzero(combined)))
+        self.assertTrue(np.all(repaired[holes] == 175))
+
     def test_detector_tiles_cover_entire_axis_and_anchor_both_edges(self):
         origins = _tile_origins(1280, 640, 0.25)
         self.assertEqual(origins[0], 0)
