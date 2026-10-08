@@ -7,12 +7,18 @@ out/
 stage1_out/
 stage2_out/
 stage3_out/
+stage4_out/
+runs/
 .stage1_out-*/
 .stage2_out-*/
 .stage3_out-*/
+.stage4_out-*/
 frames/
 masks/
 *.pt
+*.safetensors
+*.onnx
+/models/openearthmap-mask2former/
 .tmp/
 
 # Local input footage is large and may have redistribution/privacy constraints.
@@ -31,6 +37,7 @@ sample_vids/*.mp4
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage1Preview.unity*
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage2MetricWorld.unity*
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage3ActorPlayback.unity*
+/UnityProject/DroneWorldRecreation/Assets/Scenes/Stage4SemanticReview.unity*
 
 # Superseded experimental Unity project retained locally for reference only.
 /UnityProject/My project/
