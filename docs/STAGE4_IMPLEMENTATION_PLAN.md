@@ -138,3 +138,93 @@ metric truth from this fixed top-down shot: <https://github.com/DepthAnything/De
 - Generated components record semantic confidence, source hashes, height source,
   assumed/measured status, and original polygon ID.
 - Stage 3 playback is composed into the final scene only after static geometry passes.
+
+## Staged implementation
+
+### Stage 4A - semantic proposal and review (current milestone)
+
+Inputs: passing Stage 1 + Stage 2, plus either an automatic backend or corrected label
+PNG.
+
+Outputs:
+
+- canonical `semantic_labels.png`;
+- `semantic_overlay.png`;
+- one binary class mask per canonical class;
+- connected-component audit JSON;
+- provenance/quality `report.json`;
+- Unity `Stage4SemanticReview.unity` scene.
+
+Passing Stage 4A means the artifact is structurally valid, not that the labels are
+correct. The operator must inspect the overlay and create a hash-bound acceptance record.
+
+### Stage 4B - accepted raster to validated polygons
+
+- Require `stage4-semantic-acceptance-v1` matching the exact Stage 4A report and labels.
+- Extract, simplify, regularize, map, and validate polygons.
+- Emit pixel and Unity X/Z coordinates plus comparison overlays.
+- Do not generate meshes on failed topology or stale acceptance.
+
+### Stage 4C - height policy and building generation
+
+- Require an explicit height policy.
+- Create extruded building/curb/static-region meshes.
+- Record every assumed height and roof type.
+- Validate mesh manifoldness, winding, bounds, collider complexity, and overlaps.
+
+### Stage 4D - optional objects and appearance
+
+- Detect/review trees, poles, signals, lamps, and other static props.
+- Replace placeholders with configured prefabs.
+- Generate roof/facade materials and LOD/collider policies.
+
+### Stage 4E - composition and final QA
+
+- Compose Stage 4 geometry with Stage 3 actor playback.
+- Check actors against ground, buildings, and world boundaries over the full timeline.
+- Produce a final scene manifest with the complete Stage 1-4 provenance chain.
+
+## Stage 4A quality gate
+
+Hard failures:
+
+- stale or failed Stage 1/2 input;
+- missing, unreadable, escaping, or dimensionally inconsistent artifacts;
+- unknown canonical label IDs;
+- non-zero labels outside the Stage 1 valid mask;
+- excessive unlabeled valid area;
+- corrupt output images or mismatched output hashes;
+- unsafe output replacement;
+- provider/model failure or non-finite metadata.
+
+Warnings requiring review:
+
+- generic/non-aerial model domain;
+- unusually high building, unknown, or other-static coverage;
+- excessive component fragmentation;
+- road not reaching an image boundary;
+- no buildings or vegetation (valid for an intersection-only scene);
+- approximate Stage 2 scale.
+
+Operator acceptance is a separate gate. Stage 4B must reject an absent, revoked, or stale
+acceptance record even if the Stage 4A structural gate passed.
+
+## Testing strategy
+
+- Unit fixtures for upstream hash and dimension validation.
+- Synthetic canonical maps covering holes, multiple components, invalid labels,
+  unsupported pixels, and fragmentation cleanup.
+- Atomic-publication and unrelated-directory refusal tests.
+- Fake semantic provider tests; unit tests never download model weights.
+- Real sample smoke test producing review artifacts from `stage1_out`.
+- Unity compilation/import tests for stale hashes, texture dimensions, acceptance, and
+  scene preservation after rejection.
+- Later Stage 4B/4C tests for polygon topology, homography mapping, triangulation,
+  extrusion winding, bounds, and colliders.
+
+## Completion criteria
+
+Stage 4 is complete only when an operator can run Stage 1 through Stage 4 on unseen
+footage, review/correct the semantic map, produce valid editable geometry, see Stage 3
+actors replay over it, and trace every object back to exact source artifacts and either
+an observation or an explicit assumption.
