@@ -45,3 +45,42 @@ static labels; they remain Stage 3 actors.
 
 The bundle is staged in a sibling temporary directory and replaces only an existing
 directory containing `.stage4-semantics-output`.
+
+## Gate semantics
+
+`report.json.pass: true` means the inputs, provider output, label schema, dimensions,
+coverage, and artifact hashes are structurally valid. It does not mean semantic accuracy
+has been established. The report therefore always contains:
+
+```json
+{
+  "requires_human_review": true,
+  "ready_for_geometry": false
+}
+```
+
+Unity may create `Stage4SemanticReview.unity` from a passing proposal. It must not create
+3D geometry until the operator records acceptance.
+
+## Acceptance record
+
+After inspecting the ground and overlay, Unity may write
+`semantic_acceptance.json` with schema `stage4-semantic-acceptance-v1`. It contains the
+exact Stage 4 report SHA-256, semantic-label SHA-256, acceptance state, and UTC time.
+
+Stage 4B must recompute both hashes and reject missing, revoked, or stale acceptance.
+Regenerating Stage 4A invalidates the old acceptance automatically.
+
+## Automatic-provider limitation
+
+The default provider uses a pinned Mask2Former-Swin checkpoint fine-tuned on the eight
+OpenEarthMap aerial/satellite classes. It combines padded global context with
+overlapping square crops and flip TTA. A pinned Cityscapes model is used only as a road
+specialist: its output can promote a pixel to canonical `road`, but its building and all
+other predictions are discarded. This conservative fusion fixes the observed
+developed-space/road ambiguity without restoring the old false-building failure.
+
+OpenEarthMap imagery is typically 0.25–0.5 m GSD. Different ground resolution,
+geography, shadows, seasons, camera rendering, or synthetic footage can still fail.
+The overlay must be reviewed, and a corrected canonical PNG remains the authoritative
+path when boundaries are wrong.
