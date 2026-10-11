@@ -110,3 +110,110 @@ def verify_classes(path: Path) -> None:
     if model.task != "semantic":
         raise ValueError(f"expected semantic task, got {model.task!r}")
     print("Semantic classes verified: " + ", ".join(names))
+
+
+def verify_aerial_model(directory: Path) -> None:
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"OpenEarthMap model directory does not exist: {directory}")
+    for filename, (expected_size, expected_hash) in AERIAL_FILES.items():
+        path = directory / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"OpenEarthMap model file is missing: {path}")
+        if path.stat().st_size != expected_size:
+            raise ValueError(
+                f"{filename} size mismatch: got {path.stat().st_size}, "
+                f"expected {expected_size}")
+        actual = file_sha256(path)
+        if actual != expected_hash:
+            raise ValueError(
+                f"{filename} SHA-256 mismatch: got {actual}, expected {expected_hash}")
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    if config.get("architectures") != ["Mask2FormerForUniversalSegmentation"]:
+        raise ValueError("OpenEarthMap model has an unexpected architecture")
+    labels = config.get("id2label")
+    if not isinstance(labels, dict) or len(labels) != len(AERIAL_CLASSES):
+        raise ValueError(
+            "OpenEarthMap checkpoint must expose exactly eight output classes")
+
+
+def download_aerial_model(output: Path, force: bool) -> None:
+    output = Path(output).resolve()
+    if output.exists() and not force:
+        verify_aerial_model(output)
+        print(f"Stage 4 aerial model already verified: {output}")
+        return
+    from huggingface_hub import snapshot_download
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}-", dir=output.parent))
+    backup = output.with_name(f".{output.name}-previous")
+    try:
+        snapshot_download(
+            AERIAL_REPOSITORY,
+            revision=AERIAL_REVISION,
+            local_dir=temporary,
+            allow_patterns=list(AERIAL_FILES),
+        )
+        verify_aerial_model(temporary)
+        if backup.exists():
+            shutil.rmtree(backup)
+        if output.exists():
+            output.replace(backup)
+        temporary.replace(output)
+        if backup.exists():
+            shutil.rmtree(backup)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if backup.exists() and not output.exists():
+            backup.replace(output)
+        raise
+    print(f"Verified Stage 4 OpenEarthMap model installed: {output}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=AERIAL_DIRECTORY)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument(
+        "--legacy-cityscapes", action="store_true",
+        help="download/verify the superseded street-view bootstrap instead")
+    parser.add_argument(
+        "--aerial-only", action="store_true",
+        help="install only OpenEarthMap, without the conservative road specialist")
+    args = parser.parse_args()
+    output = args.output.resolve()
+    try:
+        if args.legacy_cityscapes:
+            legacy_output = (Path("models/yolo26x-sem.pt")
+                             if args.output == AERIAL_DIRECTORY else args.output).resolve()
+            if args.verify_only:
+                verify_legacy_model(legacy_output)
+            else:
+                download(legacy_output, args.force)
+            verify_classes(legacy_output)
+        else:
+            if args.verify_only:
+                verify_aerial_model(output)
+            else:
+                download_aerial_model(output, args.force)
+            print("Aerial classes verified: " + ", ".join(AERIAL_CLASSES))
+            if not args.aerial_only:
+                legacy_output = Path("models/yolo26x-sem.pt").resolve()
+                if args.verify_only:
+                    verify_legacy_model(legacy_output)
+                else:
+                    download(legacy_output, args.force)
+                verify_classes(legacy_output)
+    except Exception as exception:
+        print(f"FATAL: {exception}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
