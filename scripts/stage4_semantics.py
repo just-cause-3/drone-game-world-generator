@@ -126,3 +126,143 @@ class SemanticProvider(Protocol):
     def metadata(self) -> dict: ...
 
     def predict(self, image: np.ndarray) -> np.ndarray: ...
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exception:
+        raise ValueError(f"invalid JSON in {path}: {exception}") from exception
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object in {path}")
+    return value
+
+
+def _bundle_path(root: Path, relative, label: str) -> Path:
+    if not isinstance(relative, str) or not relative.strip():
+        raise ValueError(f"missing {label} output path")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exception:
+        raise ValueError(f"{label} path escapes its bundle") from exception
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def _read_bundle_image(path: Path, flags: int, expected_shape: tuple[int, int],
+                       label: str) -> np.ndarray:
+    """Decode a small pipeline image robustly after long GPU-heavy stages.
+
+    Reading bytes first avoids intermittent Windows/OpenCV filename decoder failures.
+    Retrying after collection also handles temporary allocation pressure left by an
+    earlier detector without accepting a wrong-sized or corrupt artifact.
+    """
+    last_shape = None
+    last_error = None
+    for _ in range(3):
+        try:
+            encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+            image = cv2.imdecode(encoded, flags) if encoded.size else None
+        except (OSError, cv2.error) as exception:
+            image = None
+            last_error = str(exception)
+        if image is not None:
+            last_shape = image.shape[:2]
+            if last_shape == expected_shape:
+                return image
+        gc.collect()
+    detail = (
+        f"decoded shape was {last_shape}" if last_shape is not None
+        else f"decoder returned no image{': ' + last_error if last_error else ''}")
+    raise ValueError(
+        f"Stage 1 {label} is unreadable or dimensionally inconsistent; "
+        f"expected {expected_shape[1]}x{expected_shape[0]}, {detail}")
+
+
+def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
+    stage1_root = Path(stage1_bundle).resolve()
+    stage1_report_path = stage1_root / "report.json"
+    if not stage1_report_path.is_file():
+        raise FileNotFoundError(f"Stage 1 report not found: {stage1_report_path}")
+    stage1 = _read_json(stage1_report_path)
+    if stage1.get("schema_version") != STAGE1_SCHEMA or stage1.get("stage") != 1:
+        raise ValueError("the selected directory is not a Stage 1 ground bundle")
+    if stage1.get("pass") is not True:
+        raise ValueError("Stage 4 refuses a failed Stage 1 bundle")
+    try:
+        width = int(stage1["input"]["width"])
+        height = int(stage1["input"]["height"])
+        outputs1 = stage1["outputs"]
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("Stage 1 report is missing dimensions or outputs") from exception
+    if width <= 0 or height <= 0:
+        raise ValueError("Stage 1 dimensions are invalid")
+    ground_path = _bundle_path(stage1_root, outputs1.get("ground"), "ground image")
+    valid_path = _bundle_path(stage1_root, outputs1.get("valid_mask"), "valid mask")
+    expected_shape = (height, width)
+    ground = _read_bundle_image(
+        ground_path, cv2.IMREAD_COLOR, expected_shape, "ground")
+    valid = _read_bundle_image(
+        valid_path, cv2.IMREAD_GRAYSCALE, expected_shape, "valid mask")
+    valid = valid > 0
+    if not np.any(valid):
+        raise ValueError("Stage 1 valid mask contains no supported pixels")
+
+    stage2_root = Path(stage2_bundle).resolve()
+    calibration_path = stage2_root / "world_calibration.json"
+    if not calibration_path.is_file():
+        raise FileNotFoundError(f"Stage 2 calibration not found: {calibration_path}")
+    stage2 = _read_json(calibration_path)
+    if stage2.get("schema_version") != STAGE2_SCHEMA or stage2.get("stage") != 2:
+        raise ValueError("the selected directory is not a Stage 2 calibration bundle")
+    if stage2.get("pass") is not True:
+        raise ValueError("Stage 4 refuses a failed Stage 2 calibration")
+    try:
+        source2 = stage2["source_stage1"]
+        matrix = np.asarray(stage2["reference_pixel_to_world_xz"], dtype=np.float64)
+        scale_confidence = str(stage2["confidence"])
+        metric_scale_is_assumed = bool(
+            stage2["coordinate_system"].get("metric_scale_is_assumed", False))
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("Stage 2 calibration is missing required data") from exception
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("Stage 2 homography is not a finite 3x3 matrix")
+    if abs(float(np.linalg.det(matrix))) < 1e-12:
+        raise ValueError("Stage 2 homography is singular")
+    if source2.get("report_sha256") != _sha256(stage1_report_path):
+        raise ValueError("Stage 2 calibration is stale: Stage 1 report hash changed")
+    if source2.get("ground_sha256") != _sha256(ground_path):
+        raise ValueError("Stage 2 calibration is stale: Stage 1 ground hash changed")
+    if source2.get("source_video_sha256") != stage1["input"].get("sha256"):
+        raise ValueError("Stage 2 calibration belongs to another source video")
+    if (int(source2.get("pixel_width", -1)) != width or
+            int(source2.get("pixel_height", -1)) != height):
+        raise ValueError("Stage 2 dimensions do not match Stage 1")
+
+    return {
+        "stage1_root": stage1_root,
+        "stage1": stage1,
+        "stage1_report_path": stage1_report_path,
+        "ground_path": ground_path,
+        "valid_path": valid_path,
+        "ground": ground,
+        "valid": valid,
+        "stage2_root": stage2_root,
+        "stage2": stage2,
+        "calibration_path": calibration_path,
+        "pixel_to_world": matrix,
+        "width": width,
+        "height": height,
+        "scale_confidence": scale_confidence,
+        "metric_scale_is_assumed": metric_scale_is_assumed,
+    }
