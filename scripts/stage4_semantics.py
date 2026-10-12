@@ -296,3 +296,126 @@ class ExternalLabelProvider:
                 f"external labels are {labels.shape[1]}x{labels.shape[0]}; expected "
                 f"{image.shape[1]}x{image.shape[0]}")
         return labels.astype(np.uint8, copy=False)
+
+
+class OpenEarthMapMask2FormerProvider:
+    """Dense aerial land-cover proposal from a pinned OpenEarthMap checkpoint."""
+
+    def __init__(self, options: Stage4Options):
+        import torch
+        from transformers import (
+            AutoImageProcessor,
+            Mask2FormerForUniversalSegmentation,
+        )
+
+        self.options = options
+        self.path = Path(options.semantic_model).resolve()
+        verify_aerial_model(self.path)
+        self.torch = torch
+        self.processor = AutoImageProcessor.from_pretrained(
+            str(self.path), local_files_only=True, use_fast=False)
+        self.model = Mask2FormerForUniversalSegmentation.from_pretrained(
+            str(self.path), local_files_only=True)
+        if self.model.config.num_labels != len(AERIAL_CLASSES):
+            raise ValueError(
+                "OpenEarthMap checkpoint does not expose the pinned eight-class head")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device).eval()
+        self.pass_count = 0
+        weights = self.path / "model.safetensors"
+        self._metadata = {
+            "implementation": "openearthmap-mask2former-swin-consensus-v1",
+            "model": str(self.path),
+            "model_revision": AERIAL_REVISION,
+            "model_size": weights.stat().st_size,
+            "model_sha256": _sha256(weights),
+            "expected_model_sha256": AERIAL_FILES["model.safetensors"][1],
+            "device": str(self.device),
+            "domain": "openearthmap_aerial_satellite_0.25_0.5m_gsd",
+            "automatic": True,
+            "raw_classes": list(AERIAL_CLASSES),
+            "class_to_canonical": dict(OPENEARTHMAP_CLASS_TO_CANONICAL),
+            "reported_validation_miou": 0.5202420374155045,
+        }
+
+    @property
+    def metadata(self) -> dict:
+        result = dict(self._metadata)
+        result["inference_passes"] = self.pass_count
+        return result
+
+    def _predict_one(self, image: np.ndarray) -> np.ndarray:
+        from PIL import Image
+
+        height, width = image.shape[:2]
+        side = max(height, width)
+        top = (side - height) // 2
+        bottom = side - height - top
+        left = (side - width) // 2
+        right = side - width - left
+        square = cv2.copyMakeBorder(
+            image, top, bottom, left, right, cv2.BORDER_REFLECT_101)
+        rgb = cv2.cvtColor(square, cv2.COLOR_BGR2RGB)
+        tensors = self.processor(
+            images=Image.fromarray(rgb), return_tensors="pt")
+        tensors = {name: value.to(self.device)
+                   for name, value in tensors.items()}
+        with self.torch.inference_mode():
+            output = self.model(**tensors)
+        raw = self.processor.post_process_semantic_segmentation(
+            output, target_sizes=[(side, side)])[0]
+        raw = raw.detach().cpu().numpy()[top:top + height, left:left + width]
+        if raw.shape != (height, width):
+            raise ValueError(
+                f"OpenEarthMap model returned invalid mask shape {raw.shape}")
+        mapped = np.zeros((height, width), dtype=np.uint8)
+        for raw_id in np.unique(raw):
+            raw_index = int(raw_id)
+            if raw_index < 0 or raw_index >= len(AERIAL_CLASSES):
+                raise ValueError(
+                    f"OpenEarthMap model returned unknown class ID {raw_index}")
+            raw_name = AERIAL_CLASSES[raw_index]
+            mapped[raw == raw_index] = CANONICAL_IDS[
+                OPENEARTHMAP_CLASS_TO_CANONICAL[raw_name]]
+        self.pass_count += 1
+        return mapped
+
+    @staticmethod
+    def _blend_weights(height: int, width: int) -> np.ndarray:
+        y = np.maximum(np.hanning(max(3, height))[:height], 0.15)
+        x = np.maximum(np.hanning(max(3, width))[:width], 0.15)
+        return np.outer(y, x).astype(np.float32)
+
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        scores = np.zeros(
+            (height, width, len(CANONICAL_CLASSES)), dtype=np.float32)
+
+        def add(labels: np.ndarray, y0: int, x0: int,
+                weight: np.ndarray | float) -> None:
+            region = scores[y0:y0 + labels.shape[0], x0:x0 + labels.shape[1]]
+            for class_id in range(len(CANONICAL_CLASSES)):
+                region[:, :, class_id] += weight * (labels == class_id)
+
+        # The padded whole-image pass supplies context; overlapping square crops retain
+        # the aerial model's training geometry and dominate local decisions.
+        add(self._predict_one(image), 0, 0, 0.35)
+        if self.options.horizontal_flip_tta:
+            labels = self._predict_one(
+                np.ascontiguousarray(image[:, ::-1]))[:, ::-1]
+            add(labels, 0, 0, 0.35)
+
+        tile = self.options.tile_size
+        if tile > 0 and (tile < width or tile < height):
+            for y0 in _tile_origins(height, tile, self.options.tile_overlap):
+                for x0 in _tile_origins(width, tile, self.options.tile_overlap):
+                    crop = image[y0:min(height, y0 + tile),
+                                 x0:min(width, x0 + tile)]
+                    weight = self._blend_weights(*crop.shape[:2])
+                    add(self._predict_one(crop), y0, x0, weight)
+                    if self.options.horizontal_flip_tta:
+                        labels = self._predict_one(
+                            np.ascontiguousarray(crop[:, ::-1]))[:, ::-1]
+                        add(labels, y0, x0, weight)
+        return np.argmax(scores, axis=2).astype(np.uint8)
