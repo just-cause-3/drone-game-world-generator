@@ -580,3 +580,70 @@ def _fuse_aerial_with_road_specialist(
     fused = aerial_labels.copy()
     fused[specialist_labels == CANONICAL_IDS["road"]] = CANONICAL_IDS["road"]
     return fused
+
+
+def _validate_labels(labels: np.ndarray, height: int, width: int) -> np.ndarray:
+    if not isinstance(labels, np.ndarray) or labels.ndim != 2:
+        raise ValueError("semantic provider must return a two-dimensional label array")
+    if labels.shape != (height, width):
+        raise ValueError(
+            f"semantic provider returned {labels.shape}; expected {(height, width)}")
+    if not np.issubdtype(labels.dtype, np.integer):
+        raise ValueError("semantic labels must use an integer dtype")
+    minimum = int(np.min(labels))
+    maximum = int(np.max(labels))
+    if minimum < 0 or maximum >= len(CANONICAL_CLASSES):
+        raise ValueError(
+            f"semantic labels contain IDs outside 0..{len(CANONICAL_CLASSES) - 1}")
+    return labels.astype(np.uint8, copy=True)
+
+
+def _clean_components(labels: np.ndarray, minimum_area: int) -> tuple[np.ndarray, dict]:
+    cleaned = labels.copy()
+    removed_components = 0
+    removed_pixels = 0
+    if minimum_area > 0:
+        for class_id in range(1, len(CANONICAL_CLASSES)):
+            binary = (cleaned == class_id).astype(np.uint8)
+            count, connected, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+            for component in range(1, count):
+                area = int(stats[component, cv2.CC_STAT_AREA])
+                if area < minimum_area:
+                    cleaned[connected == component] = CANONICAL_IDS["unknown"]
+                    removed_components += 1
+                    removed_pixels += area
+    return cleaned, {
+        "removed_components": removed_components,
+        "removed_pixels": removed_pixels,
+        "minimum_component_area_px": minimum_area,
+    }
+
+
+def _component_audit(labels: np.ndarray) -> dict:
+    classes = []
+    for class_id, class_name in enumerate(CANONICAL_CLASSES[1:], start=1):
+        binary = (labels == class_id).astype(np.uint8)
+        count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+        components = []
+        for component in range(1, count):
+            x, y, width, height, area = (
+                int(value) for value in stats[component])
+            components.append({
+                "id": component,
+                "area_px": area,
+                "bounds": {"x": x, "y": y, "width": width, "height": height},
+                "centroid": {
+                    "u": round(float(centroids[component, 0]), 4),
+                    "v": round(float(centroids[component, 1]), 4),
+                },
+                "touches_image_border": bool(
+                    x == 0 or y == 0 or x + width == labels.shape[1] or
+                    y + height == labels.shape[0]),
+            })
+        classes.append({
+            "id": class_id,
+            "name": class_name,
+            "component_count": len(components),
+            "components": components,
+        })
+    return {"schema_version": "stage4-components-v1", "classes": classes}
