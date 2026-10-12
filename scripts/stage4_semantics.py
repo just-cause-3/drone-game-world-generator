@@ -647,3 +647,256 @@ def _component_audit(labels: np.ndarray) -> dict:
             "components": components,
         })
     return {"schema_version": "stage4-components-v1", "classes": classes}
+
+
+def _write_png(path: Path, image: np.ndarray) -> None:
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"could not write image: {path}")
+
+
+def _draw_overlay(ground: np.ndarray, labels: np.ndarray, valid: np.ndarray,
+                  alpha: float) -> np.ndarray:
+    color = np.zeros_like(ground)
+    for class_id, bgr in enumerate(CANONICAL_COLORS_BGR):
+        color[labels == class_id] = bgr
+    overlay = ground.copy()
+    blend_pixels = valid & (labels != CANONICAL_IDS["unknown"])
+    blended = cv2.addWeighted(ground, 1.0 - alpha, color, alpha, 0.0)
+    overlay[blend_pixels] = blended[blend_pixels]
+    overlay[valid & (labels == CANONICAL_IDS["unknown"])] = cv2.addWeighted(
+        ground, 0.7, color, 0.3, 0.0)[valid & (labels == CANONICAL_IDS["unknown"])]
+
+    legend_height = 18 + 24 * len(CANONICAL_CLASSES)
+    legend_width = 220
+    cv2.rectangle(overlay, (8, 8), (8 + legend_width, 8 + legend_height),
+                  (15, 15, 15), -1)
+    cv2.putText(overlay, "STAGE 4A - REVIEW REQUIRED", (18, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
+    for index, (name, bgr) in enumerate(zip(CANONICAL_CLASSES, CANONICAL_COLORS_BGR)):
+        y = 50 + index * 24
+        cv2.rectangle(overlay, (18, y - 12), (34, y + 4), bgr, -1)
+        cv2.putText(overlay, f"{index}: {name}", (42, y + 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255),
+                    1, cv2.LINE_AA)
+    return overlay
+
+
+def _validate_output_target(output: Path) -> None:
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Stage 4 output target is not a directory: {output}")
+    if output.exists() and any(output.iterdir()) and not (output / OUTPUT_MARKER).is_file():
+        raise ValueError(
+            f"refusing to replace unrelated non-empty directory: {output}")
+
+
+def _publish_directory(temporary: Path, output: Path) -> None:
+    backup = output.with_name(f".{output.name}-previous")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if output.exists():
+        output.replace(backup)
+    try:
+        temporary.replace(output)
+    except Exception:
+        if backup.exists() and not output.exists():
+            backup.replace(output)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+
+
+def run_stage4_semantics(stage1_bundle, stage2_bundle,
+                         output_directory="stage4_out",
+                         options: Stage4Options | None = None,
+                         provider: SemanticProvider | None = None,
+                         external_labels=None) -> dict:
+    options = options or Stage4Options()
+    options.validate()
+    inputs = _load_inputs(stage1_bundle, stage2_bundle)
+    output = Path(output_directory).resolve()
+    _validate_output_target(output)
+    if provider is not None and external_labels is not None:
+        raise ValueError("provide either a semantic provider or external labels, not both")
+    if provider is None:
+        if external_labels:
+            provider = ExternalLabelProvider(external_labels)
+        elif options.semantic_backend == "hybrid-openearthmap-road":
+            provider = HybridOpenEarthMapRoadProvider(options)
+        elif options.semantic_backend == "openearthmap-mask2former":
+            provider = OpenEarthMapMask2FormerProvider(options)
+        else:
+            provider = YoloSemanticProvider(options)
+
+    log("stage4", f"semantic provider={provider.metadata.get('implementation', 'custom')}")
+    raw_labels = _validate_labels(
+        provider.predict(inputs["ground"]), inputs["height"], inputs["width"])
+    predicted_outside_valid = int(np.count_nonzero(raw_labels[~inputs["valid"]]))
+    raw_labels[~inputs["valid"]] = CANONICAL_IDS["unknown"]
+    labels, cleanup = _clean_components(
+        raw_labels, options.minimum_component_area_px)
+    labels[~inputs["valid"]] = CANONICAL_IDS["unknown"]
+
+    valid_pixels = int(np.count_nonzero(inputs["valid"]))
+    total_pixels = inputs["width"] * inputs["height"]
+    coverage = []
+    for class_id, class_name in enumerate(CANONICAL_CLASSES):
+        count = int(np.count_nonzero((labels == class_id) & inputs["valid"]))
+        coverage.append({
+            "id": class_id,
+            "name": class_name,
+            "pixels": count,
+            "valid_area_pct": round(100.0 * count / valid_pixels, 6),
+        })
+    coverage_by_name = {item["name"]: item["valid_area_pct"] for item in coverage}
+    components = _component_audit(labels)
+    component_count = sum(item["component_count"] for item in components["classes"])
+    components_per_megapixel = component_count / max(1e-9, total_pixels / 1_000_000.0)
+
+    failures = []
+    warnings = []
+    if coverage_by_name["unknown"] > options.maximum_unknown_valid_pct:
+        failures.append(
+            f"unknown semantic area {coverage_by_name['unknown']:.2f}% exceeds "
+            f"{options.maximum_unknown_valid_pct:.2f}%")
+    if coverage_by_name["building"] > options.building_area_warning_pct:
+        warnings.append(
+            f"Building proposal covers {coverage_by_name['building']:.2f}% of valid "
+            "pixels; this is suspicious for top-down footage and must be reviewed.")
+    if coverage_by_name["other_static"] > options.other_static_warning_pct:
+        warnings.append(
+            f"Other-static proposal covers {coverage_by_name['other_static']:.2f}% of "
+            "valid pixels and may contain semantic confusion.")
+    if components_per_megapixel > options.fragmentation_warning_components_per_megapixel:
+        warnings.append(
+            f"Semantic map is fragmented ({components_per_megapixel:.1f} components per "
+            "megapixel); correct or smooth it before vectorization.")
+    if coverage_by_name["building"] == 0.0:
+        warnings.append("No building pixels were proposed; this is valid only when none are visible.")
+    if coverage_by_name["vegetation"] == 0.0:
+        warnings.append("No vegetation pixels were proposed; review if vegetation is visible.")
+    road_components = next(
+        item for item in components["classes"] if item["name"] == "road")
+    if road_components["component_count"] and not any(
+            item["touches_image_border"] for item in road_components["components"]):
+        warnings.append("No proposed road component reaches the image boundary.")
+    metadata = provider.metadata
+    if metadata.get("domain") == "cityscapes_street_view_bootstrap":
+        warnings.append(
+            "The bootstrap semantic model is trained on street-view Cityscapes, not "
+            "aerial footage. Treat every label as provisional and inspect the overlay.")
+    if "openearthmap" in str(metadata.get("domain", "")):
+        warnings.append(
+            "The proposal model is aerial-domain but remains sensitive to ground "
+            "sampling distance, geography, shadows, and synthetic/stylized footage. "
+            "Inspect every label before acceptance.")
+    if inputs["metric_scale_is_assumed"]:
+        warnings.append(
+            "Stage 2 scale is assumed; later horizontal dimensions and heights are not "
+            "physical measurements.")
+    if predicted_outside_valid:
+        warnings.append(
+            f"Forced {predicted_outside_valid} provider-labelled unsupported pixels to unknown.")
+
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}-", dir=output.parent))
+    try:
+        (temporary / OUTPUT_MARKER).write_text(STAGE4_SCHEMA, encoding="utf-8")
+        labels_path = temporary / "semantic_labels.png"
+        overlay_path = temporary / "semantic_overlay.png"
+        components_path = temporary / "components.json"
+        _write_png(labels_path, labels)
+        _write_png(
+            overlay_path,
+            _draw_overlay(inputs["ground"], labels, inputs["valid"], options.overlay_alpha))
+        components_path.write_text(
+            json.dumps(components, indent=2), encoding="utf-8")
+        mask_outputs = []
+        for class_id, class_name in enumerate(CANONICAL_CLASSES[1:], start=1):
+            filename = f"mask_{class_name}.png"
+            _write_png(temporary / filename, ((labels == class_id) * 255).astype(np.uint8))
+            mask_outputs.append({"name": class_name, "path": filename})
+
+        artifact_hashes = {
+            "semantic_labels_sha256": _sha256(labels_path),
+            "semantic_overlay_sha256": _sha256(overlay_path),
+            "components_sha256": _sha256(components_path),
+        }
+        report = {
+            "schema_version": STAGE4_SCHEMA,
+            "stage": 4,
+            "substage": "semantic_proposal",
+            "pass": not failures,
+            "requires_human_review": True,
+            "ready_for_geometry": False,
+            "failure_reasons": failures,
+            "warnings": warnings,
+            "source_stage1": {
+                "bundle_path": str(inputs["stage1_root"]),
+                "report_sha256": _sha256(inputs["stage1_report_path"]),
+                "ground_sha256": _sha256(inputs["ground_path"]),
+                "valid_mask_sha256": _sha256(inputs["valid_path"]),
+                "source_video_sha256": inputs["stage1"]["input"].get("sha256"),
+                "pixel_width": inputs["width"],
+                "pixel_height": inputs["height"],
+            },
+            "source_stage2": {
+                "bundle_path": str(inputs["stage2_root"]),
+                "calibration_sha256": _sha256(inputs["calibration_path"]),
+                "confidence": inputs["scale_confidence"],
+                "metric_scale_is_assumed": inputs["metric_scale_is_assumed"],
+            },
+            "coordinates": {
+                "space": "stage1_reference_image_pixels",
+                "origin": "top_left",
+                "u_axis": "right",
+                "v_axis": "down",
+                "future_world_mapping": "stage2_reference_pixel_to_world_xz",
+            },
+            "canonical_classes": [
+                {"id": index, "name": name}
+                for index, name in enumerate(CANONICAL_CLASSES)
+            ],
+            "semantic_provider": metadata,
+            "quality": {
+                "width": inputs["width"],
+                "height": inputs["height"],
+                "valid_pixels": valid_pixels,
+                "valid_area_pct": round(100.0 * valid_pixels / total_pixels, 6),
+                "class_coverage": coverage,
+                "known_valid_area_pct": round(100.0 - coverage_by_name["unknown"], 6),
+                "component_count": component_count,
+                "components_per_megapixel": round(components_per_megapixel, 6),
+                "cleanup": cleanup,
+                "provider_labels_outside_valid_mask": predicted_outside_valid,
+            },
+            "options": asdict(options),
+            "limitations": [
+                "A structural pass does not establish semantic accuracy.",
+                "Stationary near-nadir monocular footage does not provide measured height.",
+                "Roof appearance is not guaranteed to equal the ground-level footprint.",
+                "An operator acceptance record is required before polygonization.",
+            ],
+            "outputs": {
+                "report": "report.json",
+                "semantic_labels": "semantic_labels.png",
+                "semantic_overlay": "semantic_overlay.png",
+                "components": "components.json",
+                "class_masks": mask_outputs,
+                "acceptance": "semantic_acceptance.json",
+            },
+            "artifact_hashes": artifact_hashes,
+        }
+        (temporary / "report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        _publish_directory(temporary, output)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+
+    log(
+        "stage4",
+        f"{'PASS' if report['pass'] else 'FAIL'}: known="
+        f"{report['quality']['known_valid_area_pct']:.2f}%; "
+        f"components={component_count}; review={output / 'semantic_overlay.png'}")
+    return report
