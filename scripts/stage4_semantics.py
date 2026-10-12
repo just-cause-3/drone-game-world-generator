@@ -266,3 +266,33 @@ def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
         "scale_confidence": scale_confidence,
         "metric_scale_is_assumed": metric_scale_is_assumed,
     }
+
+
+class ExternalLabelProvider:
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"external semantic label image not found: {self.path}")
+        self._metadata = {
+            "implementation": "external-canonical-labels-v1",
+            "source": str(self.path),
+            "source_sha256": _sha256(self.path),
+            "domain": "operator_supplied_or_corrected",
+            "automatic": False,
+        }
+
+    @property
+    def metadata(self) -> dict:
+        return dict(self._metadata)
+
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        labels = cv2.imread(str(self.path), cv2.IMREAD_UNCHANGED)
+        if labels is None:
+            raise ValueError(f"external semantic label image is unreadable: {self.path}")
+        if labels.ndim != 2:
+            raise ValueError("external semantic labels must be a one-channel PNG")
+        if labels.shape != image.shape[:2]:
+            raise ValueError(
+                f"external labels are {labels.shape[1]}x{labels.shape[0]}; expected "
+                f"{image.shape[1]}x{image.shape[0]}")
+        return labels.astype(np.uint8, copy=False)
