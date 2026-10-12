@@ -419,3 +419,164 @@ class OpenEarthMapMask2FormerProvider:
                             np.ascontiguousarray(crop[:, ::-1]))[:, ::-1]
                         add(labels, y0, x0, weight)
         return np.argmax(scores, axis=2).astype(np.uint8)
+
+
+class YoloSemanticProvider:
+    def __init__(self, options: Stage4Options):
+        from ultralytics import YOLO
+
+        self.options = options
+        self.path = Path(options.semantic_model).resolve()
+        verify_legacy_model(self.path)
+        self.model = YOLO(str(self.path))
+        raw_names = self.model.names
+        names = tuple(raw_names.values()) if isinstance(raw_names, dict) else tuple(raw_names)
+        if names != EXPECTED_CLASSES or self.model.task != "semantic":
+            raise ValueError("Stage 4 semantic checkpoint has an unexpected task/class map")
+        self.names = {int(key): str(value) for key, value in raw_names.items()}
+        self.device = resolve_device("auto")
+        self.pass_count = 0
+        self._metadata = {
+            "implementation": "ultralytics-yolo26x-semantic-consensus-v1",
+            "model": str(self.path),
+            "model_size": self.path.stat().st_size,
+            "model_sha256": _sha256(self.path),
+            "expected_model_sha256": MODEL_SHA256,
+            "expected_model_size": MODEL_SIZE,
+            "device": str(self.device),
+            "domain": "cityscapes_street_view_bootstrap",
+            "automatic": True,
+            "class_to_canonical": dict(BOOTSTRAP_CLASS_TO_CANONICAL),
+        }
+
+    @property
+    def metadata(self) -> dict:
+        result = dict(self._metadata)
+        result["inference_passes"] = self.pass_count
+        return result
+
+    def _predict_one(self, image: np.ndarray) -> np.ndarray:
+        result = self.model.predict(
+            image,
+            imgsz=self.options.inference_imgsz,
+            device=self.device,
+            verbose=False,
+        )[0]
+        semantic = getattr(result, "semantic_mask", None)
+        if semantic is None or getattr(semantic, "data", None) is None:
+            raise ValueError("semantic model returned no dense semantic mask")
+        raw = semantic.data.detach().cpu().numpy()
+        if raw.ndim != 2:
+            raise ValueError(f"semantic model returned invalid mask shape {raw.shape}")
+        if raw.shape != image.shape[:2]:
+            raw = cv2.resize(
+                raw.astype(np.uint8), (image.shape[1], image.shape[0]),
+                interpolation=cv2.INTER_NEAREST)
+        mapped = np.zeros(raw.shape, dtype=np.uint8)
+        for raw_id in np.unique(raw):
+            name = self.names.get(int(raw_id), "")
+            canonical = BOOTSTRAP_CLASS_TO_CANONICAL.get(name, "unknown")
+            mapped[raw == raw_id] = CANONICAL_IDS[canonical]
+        self.pass_count += 1
+        return mapped
+
+    @staticmethod
+    def _blend_weights(height: int, width: int) -> np.ndarray:
+        # A nonzero raised-cosine weight reduces tile seams without leaving edge holes.
+        y = np.maximum(np.hanning(max(3, height))[:height], 0.15)
+        x = np.maximum(np.hanning(max(3, width))[:width], 0.15)
+        return np.outer(y, x).astype(np.float32)
+
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        scores = np.zeros(
+            (height, width, len(CANONICAL_CLASSES)), dtype=np.float32)
+
+        def add(labels: np.ndarray, y0: int, x0: int, weight: np.ndarray) -> None:
+            region = scores[y0:y0 + labels.shape[0], x0:x0 + labels.shape[1]]
+            for class_id in range(len(CANONICAL_CLASSES)):
+                region[:, :, class_id] += weight * (labels == class_id)
+
+        full = self._predict_one(image)
+        add(full, 0, 0, np.ones((height, width), dtype=np.float32))
+        if self.options.horizontal_flip_tta:
+            flipped = self._predict_one(np.ascontiguousarray(image[:, ::-1]))[:, ::-1]
+            add(flipped, 0, 0, np.ones((height, width), dtype=np.float32))
+
+        tile = self.options.tile_size
+        if tile > 0 and (tile < width or tile < height):
+            for y0 in _tile_origins(height, tile, self.options.tile_overlap):
+                for x0 in _tile_origins(width, tile, self.options.tile_overlap):
+                    crop = image[y0:min(height, y0 + tile), x0:min(width, x0 + tile)]
+                    labels = self._predict_one(crop)
+                    weight = self._blend_weights(*labels.shape)
+                    add(labels, y0, x0, weight)
+                    if self.options.horizontal_flip_tta:
+                        flipped = self._predict_one(
+                            np.ascontiguousarray(crop[:, ::-1]))[:, ::-1]
+                        add(flipped, y0, x0, weight)
+        return np.argmax(scores, axis=2).astype(np.uint8)
+
+
+class HybridOpenEarthMapRoadProvider:
+    """Aerial semantics with a narrowly scoped road-mask specialist.
+
+    The Cityscapes model is never permitted to propose buildings or other static
+    classes. It can only promote an OpenEarthMap pixel to road, which addresses the
+    observed developed-space/road ambiguity without reintroducing its false buildings.
+    """
+
+    def __init__(self, options: Stage4Options):
+        aerial_options = Stage4Options(
+            **{**asdict(options),
+               "semantic_backend": "openearthmap-mask2former"})
+        road_options = Stage4Options(
+            **{**asdict(options),
+               "semantic_backend": "legacy-cityscapes-yolo",
+               "semantic_model": options.road_specialist_model})
+        self.aerial = OpenEarthMapMask2FormerProvider(aerial_options)
+        self.road = YoloSemanticProvider(road_options)
+
+    @property
+    def metadata(self) -> dict:
+        aerial = self.aerial.metadata
+        road = self.road.metadata
+        return {
+            "implementation": "hybrid-openearthmap-mask2former-yolo-road-v1",
+            "model": aerial["model"],
+            "model_size": aerial["model_size"],
+            "model_sha256": aerial["model_sha256"],
+            "model_revision": aerial["model_revision"],
+            "device": aerial["device"],
+            "domain": "openearthmap_aerial_plus_cityscapes_road_only",
+            "automatic": True,
+            "class_to_canonical": aerial["class_to_canonical"],
+            "aerial_provider": aerial,
+            "road_specialist": {
+                "implementation": road["implementation"],
+                "model": road["model"],
+                "model_sha256": road["model_sha256"],
+                "domain": road["domain"],
+                "allowed_output": "road_only",
+                "inference_passes": road["inference_passes"],
+            },
+            "fusion_policy": (
+                "OpenEarthMap owns every class; pinned Cityscapes output may only "
+                "promote pixels to canonical road"),
+            "inference_passes": (
+                aerial["inference_passes"] + road["inference_passes"]),
+        }
+
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        labels = self.aerial.predict(image)
+        road_labels = self.road.predict(image)
+        return _fuse_aerial_with_road_specialist(labels, road_labels)
+
+
+def _fuse_aerial_with_road_specialist(
+        aerial_labels: np.ndarray, specialist_labels: np.ndarray) -> np.ndarray:
+    if aerial_labels.shape != specialist_labels.shape:
+        raise ValueError("semantic fusion inputs must have identical dimensions")
+    fused = aerial_labels.copy()
+    fused[specialist_labels == CANONICAL_IDS["road"]] = CANONICAL_IDS["road"]
+    return fused
