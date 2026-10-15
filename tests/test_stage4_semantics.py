@@ -168,6 +168,60 @@ class Stage4SemanticTests(unittest.TestCase):
             cv2.IMREAD_UNCHANGED)
         self.assertEqual(cleaned[50, 50], CANONICAL_IDS["unknown"])
 
+    def test_excessive_unknown_area_fails_without_geometry_readiness(self):
+        stage1, stage2 = self.make_bundles()
+        labels = np.zeros((100, 160), np.uint8)
+        labels[:, :20] = CANONICAL_IDS["road"]
+
+        report = run_stage4_semantics(
+            stage1, stage2, self.root / "stage4",
+            provider=FakeSemanticProvider(labels))
+
+        self.assertFalse(report["pass"])
+        self.assertFalse(report["ready_for_geometry"])
+        self.assertTrue(any(
+            "unknown semantic area" in reason
+            for reason in report["failure_reasons"]))
+
+    def test_rejects_unknown_canonical_label_id(self):
+        stage1, stage2 = self.make_bundles()
+        labels = self.labels()
+        labels[0, 0] = 99
+        with self.assertRaisesRegex(ValueError, "outside 0"):
+            run_stage4_semantics(
+                stage1, stage2, self.root / "stage4",
+                provider=FakeSemanticProvider(labels))
+
+    def test_masks_unsupported_pixels_to_unknown(self):
+        stage1, stage2 = self.make_bundles()
+        valid = cv2.imread(str(stage1 / "valid_mask.png"), cv2.IMREAD_GRAYSCALE)
+        valid[:, :10] = 0
+        cv2.imwrite(str(stage1 / "valid_mask.png"), valid)
+        labels = self.labels()
+
+        report = run_stage4_semantics(
+            stage1, stage2, self.root / "stage4",
+            provider=FakeSemanticProvider(labels))
+
+        self.assertTrue(report["pass"])
+        self.assertGreater(
+            report["quality"]["provider_labels_outside_valid_mask"], 0)
+        cleaned = cv2.imread(
+            str(self.root / "stage4" / "semantic_labels.png"),
+            cv2.IMREAD_UNCHANGED)
+        self.assertTrue(np.all(cleaned[:, :10] == CANONICAL_IDS["unknown"]))
+
+    def test_rejects_stale_stage2_binding(self):
+        stage1, stage2 = self.make_bundles()
+        report_path = stage1 / "report.json"
+        value = json.loads(report_path.read_text(encoding="utf-8"))
+        value["input"]["path"] = "changed.mp4"
+        report_path.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            run_stage4_semantics(
+                stage1, stage2, self.root / "stage4",
+                provider=FakeSemanticProvider(self.labels()))
+
 
 if __name__ == "__main__":
     unittest.main()
