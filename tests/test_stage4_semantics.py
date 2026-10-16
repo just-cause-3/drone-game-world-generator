@@ -222,6 +222,45 @@ class Stage4SemanticTests(unittest.TestCase):
                 stage1, stage2, self.root / "stage4",
                 provider=FakeSemanticProvider(self.labels()))
 
+    def test_refuses_to_replace_unrelated_output_directory(self):
+        stage1, stage2 = self.make_bundles()
+        output = self.root / "unrelated"
+        output.mkdir()
+        (output / "keep.txt").write_text("user data", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unrelated non-empty"):
+            run_stage4_semantics(
+                stage1, stage2, output,
+                provider=FakeSemanticProvider(self.labels()))
+        self.assertEqual(
+            (output / "keep.txt").read_text(encoding="utf-8"), "user data")
+
+    def test_external_canonical_png_skips_automatic_model(self):
+        stage1, stage2 = self.make_bundles()
+        labels_path = self.root / "corrected.png"
+        cv2.imwrite(str(labels_path), self.labels())
+
+        report = run_stage4_semantics(
+            stage1, stage2, self.root / "stage4",
+            external_labels=labels_path)
+
+        self.assertTrue(report["pass"])
+        self.assertFalse(report["semantic_provider"]["automatic"])
+        self.assertEqual(
+            report["semantic_provider"]["source_sha256"], sha256(labels_path))
+
+    def test_pipeline_stage4_reports_quality_gate_status(self):
+        from unittest.mock import patch
+
+        with patch("pipeline.run_stage4_semantics") as run_mock:
+            run_mock.return_value = {
+                "pass": False,
+                "failure_reasons": ["too much unknown area"],
+            }
+            result = pipeline.main([
+                "stage4", "stage1_out", "stage2_out", "--output", "stage4_out",
+            ])
+        self.assertEqual(result, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
