@@ -20,6 +20,7 @@ from scripts.stage3_tracking import (
 class FakeDetector:
     def __init__(self, detections_by_frame):
         self.detections_by_frame = detections_by_frame
+        self.calls = []
         self.metadata = {
             "model": "synthetic-fixture",
             "model_sha256": "0" * 64,
@@ -30,6 +31,7 @@ class FakeDetector:
 
     def detect(self, frame, frame_index):
         del frame
+        self.calls.append(frame_index)
         return [dict(item) for item in self.detections_by_frame.get(frame_index, [])]
 
 
@@ -224,6 +226,36 @@ class Stage3TrackingTests(unittest.TestCase):
         xs = [sample["x"] for sample in track["samples"]]
         self.assertLess(max(xs) - min(xs), 1e-5)
 
+    def test_fast_stride_detects_alternate_frames_but_keeps_full_timeline(self):
+        frame_count = 8
+        stage1, stage2 = self.make_bundles(frame_count=frame_count)
+        frames = {
+            index: [detection("car", 30 + 2 * index, 50, 0.9, 12)]
+            for index in range(frame_count)
+        }
+        detector = FakeDetector(frames)
+        output = self.root / "fast"
+        report = run_stage3(
+            stage1,
+            stage2,
+            output,
+            Stage3Options(
+                detector_frame_stride=2,
+                min_confirmed_observations=3,
+            ),
+            detector,
+        )
+
+        self.assertTrue(report["pass"], report["failure_reasons"])
+        self.assertEqual([0, 2, 4, 6, 7], detector.calls)
+        self.assertEqual(5, report["quality"]["detector_inference_frames"])
+        self.assertEqual(3, report["quality"]["detector_skipped_frames"])
+        track = json.loads((output / "tracks.json").read_text())["tracks"][0]
+        self.assertEqual(list(range(frame_count)), [
+            sample["frame"] for sample in track["samples"]])
+        self.assertFalse(track["samples"][1]["observed"])
+        self.assertTrue(track["samples"][-1]["observed"])
+
     def test_detection_outside_reconstructed_ground_is_excluded(self):
         stage1, stage2 = self.make_bundles(frame_count=4)
         frames = {
@@ -239,6 +271,27 @@ class Stage3TrackingTests(unittest.TestCase):
         self.assertEqual(report["quality"]["out_of_bounds_detections"], 4)
         tracks = json.loads((output / "tracks.json").read_text())
         self.assertEqual(tracks["tracks"], [])
+
+    def test_stationary_person_candidates_are_not_exported_as_dynamic_actors(self):
+        stage1, stage2 = self.make_bundles(frame_count=8)
+        frames = {
+            index: [detection("person", 80, 50, 0.9, 8)]
+            for index in range(8)
+        }
+        output = self.root / "stationary_person"
+        report = run_stage3(
+            stage1,
+            stage2,
+            output,
+            Stage3Options(min_confirmed_observations=3),
+            FakeDetector(frames),
+        )
+        self.assertTrue(report["pass"])
+        self.assertEqual(0, report["quality"]["confirmed_tracks"])
+        self.assertEqual(
+            1, report["quality"]["discarded_stationary_person_tracks"])
+        tracks = json.loads((output / "tracks.json").read_text())
+        self.assertEqual([], tracks["tracks"])
 
     def test_rejects_stale_stage2_binding(self):
         stage1, stage2 = self.make_bundles()
