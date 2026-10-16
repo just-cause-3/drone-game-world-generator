@@ -43,13 +43,17 @@ class Stage3Options:
     detector_imgsz: int = 1280
     detector_low_confidence: float = 0.08
     detector_high_confidence: float = 0.25
+    detector_car_confidence: float = 0.20
+    detector_person_confidence: float = 0.60
     detector_iou: float = 0.45
     detector_max_detections: int = 3000
     detector_full_frame: bool = True
     detector_tile_size: int = 640
     detector_tile_overlap: float = 0.25
     detector_tta: bool = True
+    detector_frame_stride: int = 1
     min_confirmed_observations: int = 5
+    person_minimum_motion_px: float = 4.0
     max_lost_frames: int = 3
     max_interpolation_frames: int = 3
     car_link_diagonal_fraction_per_frame: float = 0.015
@@ -60,6 +64,7 @@ class Stage3Options:
     appearance_cost_weight: float = 0.40
     process_noise: float = 1.0
     measurement_noise: float = 2.0
+    stationary_heading_speed_threshold: float = 0.5
     boundary_tolerance_fraction: float = 0.002
     preview_line_thickness: int = 2
 
@@ -71,6 +76,12 @@ class Stage3Options:
         if not self.detector_low_confidence < self.detector_high_confidence < 1.0:
             raise ValueError(
                 "detector_high_confidence must exceed the low threshold and be below 1")
+        if not self.detector_low_confidence <= self.detector_car_confidence < 1.0:
+            raise ValueError(
+                "detector_car_confidence must be at least the low threshold and below 1")
+        if not self.detector_low_confidence <= self.detector_person_confidence < 1.0:
+            raise ValueError(
+                "detector_person_confidence must be at least the low threshold and below 1")
         if not 0.0 < self.detector_iou < 1.0:
             raise ValueError("detector_iou must be in (0, 1)")
         if self.detector_max_detections < 1:
@@ -79,8 +90,12 @@ class Stage3Options:
             raise ValueError("detector_tile_size must be zero or at least 128")
         if not 0.0 <= self.detector_tile_overlap < 0.9:
             raise ValueError("detector_tile_overlap must be in [0, 0.9)")
+        if self.detector_frame_stride < 1:
+            raise ValueError("detector_frame_stride must be at least one")
         if self.min_confirmed_observations < 1:
             raise ValueError("min_confirmed_observations must be positive")
+        if self.person_minimum_motion_px < 0.0:
+            raise ValueError("person_minimum_motion_px cannot be negative")
         if self.max_lost_frames < 0 or self.max_interpolation_frames < 0:
             raise ValueError("gap limits cannot be negative")
         if self.max_interpolation_frames > self.max_lost_frames:
@@ -95,6 +110,8 @@ class Stage3Options:
             raise ValueError("appearance_cost_weight cannot be negative")
         if self.process_noise <= 0.0 or self.measurement_noise <= 0.0:
             raise ValueError("filter noise values must be positive")
+        if self.stationary_heading_speed_threshold < 0.0:
+            raise ValueError("stationary_heading_speed_threshold cannot be negative")
         if not 0.0 <= self.boundary_tolerance_fraction <= 0.5:
             raise ValueError("boundary_tolerance_fraction must be in [0, 0.5]")
 
@@ -401,6 +418,10 @@ class YoloActorDetector:
             "canonical_classes": {str(key): value for key, value in self.class_kinds.items()},
             "low_confidence": self.options.detector_low_confidence,
             "high_confidence": self.options.detector_high_confidence,
+            "class_confidence": {
+                "car": self.options.detector_car_confidence,
+                "person": self.options.detector_person_confidence,
+            },
             "iou": self.options.detector_iou,
             "imgsz": self.options.detector_imgsz,
             "full_frame": self.options.detector_full_frame,
@@ -435,12 +456,19 @@ class YoloActorDetector:
             kind = self.class_kinds.get(class_id)
             if kind is None:
                 continue
+            confidence = float(score)
+            minimum_confidence = (
+                self.options.detector_car_confidence
+                if kind == "car"
+                else self.options.detector_person_confidence)
+            if confidence < minimum_confidence:
+                continue
             x1, y1, x2, y2 = (float(value) for value in box)
             detections.append({
                 "kind": kind,
                 "detector_class_id": class_id,
                 "detector_class": self.model_names[class_id],
-                "confidence": float(score),
+                "confidence": confidence,
                 "bbox_xyxy": [
                     x1 + x_offset, y1 + y_offset,
                     x2 + x_offset, y2 + y_offset,
@@ -819,8 +847,14 @@ def _playback_track(track: _Track, fps: float, options: Stage3Options) -> dict:
         dx = following["x"] - previous["x"]
         dz = following["z"] - previous["z"]
         speed = math.hypot(dx, dz) / dt if dt > 0.0 else 0.0
-        if speed > 1e-5:
+        if speed > options.stationary_heading_speed_threshold:
             heading = math.degrees(math.atan2(dx, dz))
+        elif track.kind == "car":
+            nearest = min(
+                observations,
+                key=lambda observation: abs(observation["frame"] - sample["frame"]))
+            x1, y1, x2, y2 = nearest["reference_bbox_xyxy"]
+            heading = 90.0 if (x2 - x1) >= (y2 - y1) else 0.0
         elif index > 0:
             heading = samples[index - 1]["heading_deg"]
         else:
@@ -949,6 +983,7 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
         total_count = 0
         assigned_count = 0
         processed = 0
+        inference_frames = 0
         out_of_bounds_count = 0
         out_of_bounds_detections = []
         with detections_path.open("w", encoding="utf-8", newline="\n") as detection_file, \
@@ -964,7 +999,16 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                     break
                 if processed >= inputs["frame_count"]:
                     raise ValueError("CFR decoder produced more frames than Stage 1 declares")
-                raw_detections = detector.detect(frame, processed)
+                # Accuracy mode uses stride 1. Balanced fast mode uses stride 2,
+                # but still advances the tracker and writes the exact CFR clock on
+                # skipped frames. Always infer the final frame so actor lifetimes
+                # reach the end of the source clip.
+                run_inference = (
+                    processed % options.detector_frame_stride == 0 or
+                    processed == inputs["frame_count"] - 1)
+                raw_detections = detector.detect(frame, processed) if run_inference else []
+                if run_inference:
+                    inference_frames += 1
                 if not isinstance(raw_detections, list):
                     raise TypeError("detector.detect must return a list")
                 mapped = []
@@ -1066,9 +1110,21 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                 f"{inputs['frame_count']}")
 
         all_tracks = tracker.all_tracks()
-        confirmed = [track for track in all_tracks
-                     if len(track.observations) >= options.min_confirmed_observations]
-        confirmed_ids = {track.identifier for track in confirmed}
+        observation_confirmed = [
+            track for track in all_tracks
+            if len(track.observations) >= options.min_confirmed_observations]
+        static_person_tracks = []
+        confirmed = []
+        for track in observation_confirmed:
+            points = np.asarray(
+                [item["reference_anchor"] for item in track.observations],
+                dtype=np.float64)
+            maximum_motion = float(np.max(np.linalg.norm(points - points[0], axis=1)))
+            if (track.kind == "person" and
+                    maximum_motion < options.person_minimum_motion_px):
+                static_person_tracks.append(track)
+            else:
+                confirmed.append(track)
         playback_tracks = [
             _playback_track(track, inputs["fps"], options) for track in confirmed
         ]
@@ -1118,11 +1174,16 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                 f"Excluded {out_of_bounds_count} detection(s) outside the reconstructed "
                 "Stage 1 ground; actors enter and leave playback at the validated "
                 "world boundary.")
-        unconfirmed = len(all_tracks) - len(confirmed)
+        unconfirmed = len(all_tracks) - len(observation_confirmed)
         if unconfirmed:
             warnings.append(
                 f"Discarded {unconfirmed} track fragment(s) with fewer than "
                 f"{options.min_confirmed_observations} observations.")
+        if static_person_tracks:
+            warnings.append(
+                f"Discarded {len(static_person_tracks)} stationary person candidate(s) "
+                f"with less than {options.person_minimum_motion_px:g} reference-pixel "
+                "motion; dynamic playback does not treat persistent static details as people.")
 
         report = {
             "schema_version": STAGE3_SCHEMA,
@@ -1159,6 +1220,8 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
             },
             "quality": {
                 "processed_frames": processed,
+                "detector_inference_frames": inference_frames,
+                "detector_skipped_frames": processed - inference_frames,
                 "detections": total_count,
                 "detections_by_kind": dict(sorted(detection_counts.items())),
                 "high_confidence_detections": high_count,
@@ -1172,6 +1235,7 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                 "confirmed_observations": confirmed_observations,
                 "interpolated_samples": interpolated_samples,
                 "discarded_short_tracks": unconfirmed,
+                "discarded_stationary_person_tracks": len(static_person_tracks),
                 "max_speed_units_per_s_by_kind": max_speeds,
                 "out_of_bounds_detections": out_of_bounds_count,
                 "out_of_bounds_detections_sample": out_of_bounds_detections,
