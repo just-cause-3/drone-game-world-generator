@@ -130,3 +130,131 @@ def _release_stage_resources() -> None:
             torch.cuda.empty_cache()
     except (ImportError, RuntimeError):
         pass
+
+
+def run_full_pipeline(
+        video, run_root, assumed_world_width_m: float = 40.0,
+        *, stage1_runner=run_stage1, stage2_runner=run_stage2,
+        stage3_runner=run_stage3, stage4_runner=run_stage4_semantics,
+        stage3_options: Stage3Options | None = None,
+        pipeline_mode: str = "accuracy") -> dict:
+    """Run every processing stage. Unity import is deliberately a separate caller step."""
+    source = Path(video).resolve()
+    root = Path(run_root).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"input video does not exist: {source}")
+    if not pipeline_mode.strip():
+        raise ValueError("pipeline_mode cannot be empty")
+    _prepare_run_root(root, source, pipeline_mode)
+
+    report_path = root / "pipeline_report.json"
+    pipeline_report = {
+        "schema_version": PIPELINE_SCHEMA,
+        "pass": False,
+        "status": "running",
+        "pipeline_mode": pipeline_mode,
+        "requires_stage4_human_review": True,
+        "ready_for_stage4_geometry": False,
+        "video": {"path": str(source), "sha256": _sha256(source)},
+        "assumed_world_width_m": float(assumed_world_width_m),
+        "started_utc": _utc_now(),
+        "finished_utc": None,
+        "stages": {},
+    }
+
+    def publish() -> None:
+        report_path.write_text(
+            json.dumps(pipeline_report, indent=2) + "\n", encoding="utf-8")
+
+    publish()
+    paths = {stage: root / f"stage{stage}" for stage in range(1, 5)}
+    try:
+        log("full", "Stage 1/4: validating video and reconstructing static ground")
+        stage1 = stage1_runner(source, paths[1], Stage1Options())
+        pipeline_report["stages"]["stage1"] = _stage_summary(stage1, paths[1])
+        publish()
+        if stage1.get("pass") is not True:
+            raise PipelineGateFailure(1, list(stage1.get("failure_reasons") or []))
+
+        dimensions = stage1.get("input") or {}
+        controls = root / "stage2_control_points.json"
+        _write_approximate_control_points(
+            controls, int(dimensions["width"]), int(dimensions["height"]),
+            float(assumed_world_width_m))
+        log(
+            "full",
+            f"Stage 2/4: assigning approximate {assumed_world_width_m:g} m image width")
+        stage2 = stage2_runner(paths[1], controls, paths[2], Stage2Options())
+        pipeline_report["stages"]["stage2"] = _stage_summary(stage2, paths[2])
+        publish()
+        if stage2.get("pass") is not True:
+            raise PipelineGateFailure(2, list(stage2.get("failure_reasons") or []))
+
+        log("full", "Stage 3/4: detecting and tracking cars and pedestrians")
+        stage3 = stage3_runner(
+            paths[1], paths[2], paths[3], stage3_options or Stage3Options())
+        pipeline_report["stages"]["stage3"] = _stage_summary(stage3, paths[3])
+        publish()
+        if stage3.get("pass") is not True:
+            raise PipelineGateFailure(3, list(stage3.get("failure_reasons") or []))
+
+        _release_stage_resources()
+        log("full", "Stage 4/4: proposing aerial static semantic labels")
+        stage4 = stage4_runner(paths[1], paths[2], paths[4], Stage4Options())
+        pipeline_report["stages"]["stage4"] = _stage_summary(stage4, paths[4])
+        publish()
+        if stage4.get("pass") is not True:
+            raise PipelineGateFailure(4, list(stage4.get("failure_reasons") or []))
+
+        pipeline_report["pass"] = True
+        pipeline_report["status"] = "pass_review_required"
+        log(
+            "full",
+            "PASS: Stages 1-4A passed; Stage 4 semantic review is still required")
+    except PipelineGateFailure as error:
+        pipeline_report["status"] = "quality_gate_failed"
+        pipeline_report["failed_stage"] = error.stage
+        pipeline_report["failure_reasons"] = error.reasons
+        raise
+    except KeyboardInterrupt:
+        pipeline_report["status"] = "cancelled"
+        pipeline_report["error"] = {
+            "type": "KeyboardInterrupt", "message": "pipeline cancelled by operator",
+        }
+        raise
+    except Exception as error:
+        pipeline_report["status"] = "error"
+        pipeline_report["error"] = {
+            "type": type(error).__name__, "message": str(error),
+        }
+        raise
+    finally:
+        pipeline_report["finished_utc"] = _utc_now()
+        publish()
+    return pipeline_report
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("video", help="stationary, top-down input video")
+    parser.add_argument("--run-root", required=True,
+                        help="owned folder for isolated Stage 1-4 artifacts")
+    parser.add_argument("--assumed-world-width", type=float, default=40.0,
+                        help="approximate width represented by the image (default: 40 m)")
+    args = parser.parse_args(argv)
+    try:
+        run_full_pipeline(args.video, args.run_root, args.assumed_world_width)
+        return 0
+    except PipelineGateFailure as error:
+        log("full", f"STOPPED: Stage {error.stage} quality gate failed")
+        for reason in error.reasons:
+            log("full", f"  - {reason}")
+        return 2
+    except Exception as error:
+        print(f"FATAL: full pipeline error: {error}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
