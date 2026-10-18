@@ -98,6 +98,38 @@ class FullPipelineTests(unittest.TestCase):
         self.assertEqual(1, report["failed_stage"])
         self.assertEqual(["camera cut detected"], report["failure_reasons"])
 
+    def test_refuses_unowned_nonempty_run_directory(self):
+        self.run_root.mkdir()
+        (self.run_root / "unrelated.txt").write_text("do not replace", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unrelated non-empty"):
+            run_full_pipeline(self.video, self.run_root)
+        self.assertEqual(
+            "do not replace",
+            (self.run_root / "unrelated.txt").read_text(encoding="utf-8"))
+
+    def test_refuses_reusing_run_folder_for_another_video(self):
+        second = self.root / "second.mp4"
+        second.write_bytes(b"another")
+        self.run_root.mkdir()
+        (self.run_root / RUN_MARKER).write_text(
+            json.dumps({"schema_version": PIPELINE_SCHEMA, "video": str(second)}),
+            encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "different input video"):
+            run_full_pipeline(self.video, self.run_root)
+
+    def test_fast_and_accuracy_modes_cannot_share_a_run_folder(self):
+        self.run_root.mkdir()
+        (self.run_root / RUN_MARKER).write_text(
+            json.dumps({
+                "schema_version": PIPELINE_SCHEMA,
+                "video": str(self.video.resolve()),
+                "pipeline_mode": "fast_balanced",
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "separate folder"):
+            run_full_pipeline(self.video, self.run_root)
+
 
 if __name__ == "__main__":
     unittest.main()
