@@ -87,3 +87,58 @@ def _stage4_resume_runners(video, run_root):
         return stage3
 
     return reuse_stage1, reuse_stage2, reuse_stage3
+
+
+def run_fast_pipeline(video, run_root, assumed_world_width_m: float = 40.0) -> dict:
+    """Run all stages with a full-rate timeline and half-rate Stage 3 inference."""
+    options = fast_stage3_options()
+    log(
+        "fast",
+        "Balanced fast mode: Stage 3 detects alternate frames and the tracker "
+        "interpolates the full source frame clock; resolution, tiles, and TTA remain enabled.")
+    runners = _stage4_resume_runners(video, run_root)
+    runner_arguments = {}
+    if runners is not None:
+        log(
+            "fast",
+            "Previous fast run passed Stages 1-3 and stopped in Stage 4; "
+            "resuming at Stage 4 without repeating detector work.")
+        runner_arguments = {
+            "stage1_runner": runners[0],
+            "stage2_runner": runners[1],
+            "stage3_runner": runners[2],
+        }
+    return run_full_pipeline(
+        video,
+        run_root,
+        assumed_world_width_m,
+        stage3_options=options,
+        pipeline_mode=FAST_PIPELINE_MODE,
+        **runner_arguments,
+    )
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("video", help="stationary, top-down input video")
+    parser.add_argument("--run-root", required=True,
+                        help="separate owned folder for fast-mode artifacts")
+    parser.add_argument("--assumed-world-width", type=float, default=40.0,
+                        help="approximate image width (default: 40 m)")
+    args = parser.parse_args(argv)
+    try:
+        run_fast_pipeline(args.video, args.run_root, args.assumed_world_width)
+        return 0
+    except PipelineGateFailure as error:
+        log("fast", f"STOPPED: Stage {error.stage} quality gate failed")
+        for reason in error.reasons:
+            log("fast", f"  - {reason}")
+        return 2
+    except Exception as error:
+        print(f"FATAL: fast pipeline error: {error}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
