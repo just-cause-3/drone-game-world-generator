@@ -9,8 +9,11 @@ namespace DroneWorld.Stage3.Editor
     {
         public override void OnInspectorGUI()
         {
+            EditorGUI.BeginChangeCheck();
             DrawDefaultInspector();
             var controller = (Stage3PlaybackController)target;
+            if (EditorGUI.EndChangeCheck() && Application.isPlaying)
+                controller.RebuildVisibleActors();
             Stage3TrackAsset tracks = controller.TrackAsset;
 
             EditorGUILayout.Space();

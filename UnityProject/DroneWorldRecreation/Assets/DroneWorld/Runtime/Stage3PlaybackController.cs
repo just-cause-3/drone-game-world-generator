@@ -14,6 +14,9 @@ namespace DroneWorld.Stage3
         [SerializeField] private bool loop = true;
         [SerializeField, Min(0f)] private float playbackSpeed = 1f;
         [SerializeField] private bool tintEstimatedSamples;
+        [SerializeField] private bool showStationaryCars;
+        [SerializeField] private bool showStationaryPeople;
+        [SerializeField, Min(0f)] private float stationaryMovementThreshold = 0.5f;
 
         private readonly List<ActorInstance> actors = new List<ActorInstance>();
         private float playbackTimeSeconds;
@@ -92,6 +95,11 @@ namespace DroneWorld.Stage3
             actors.Clear();
             foreach (Stage3ActorTrack track in trackAsset.Tracks)
             {
+                bool stationary = IsStationary(track);
+                if (stationary &&
+                    ((track.Kind == Stage3ActorKind.Car && !showStationaryCars) ||
+                     (track.Kind == Stage3ActorKind.Person && !showStationaryPeople)))
+                    continue;
                 GameObject prefab = track.Kind == Stage3ActorKind.Car
                     ? carPrefab : personPrefab;
                 if (prefab == null)
@@ -105,6 +113,31 @@ namespace DroneWorld.Stage3
                     track, instance.transform,
                     instance.GetComponentsInChildren<Renderer>(true)));
             }
+        }
+
+        public void RebuildVisibleActors()
+        {
+            if (!Application.isPlaying || trackAsset == null)
+                return;
+            BuildActors();
+            Evaluate();
+        }
+
+        private bool IsStationary(Stage3ActorTrack track)
+        {
+            Stage3TrackSample[] samples = track.Samples;
+            if (samples == null || samples.Length < 2)
+                return true;
+            Vector2 start = new Vector2(samples[0].X, samples[0].Z);
+            float thresholdSquared =
+                stationaryMovementThreshold * stationaryMovementThreshold;
+            foreach (Stage3TrackSample sample in samples)
+            {
+                Vector2 position = new Vector2(sample.X, sample.Z);
+                if ((position - start).sqrMagnitude >= thresholdSquared)
+                    return false;
+            }
+            return true;
         }
 
         private void Evaluate()

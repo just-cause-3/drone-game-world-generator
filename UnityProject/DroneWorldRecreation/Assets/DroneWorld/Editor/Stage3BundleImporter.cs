@@ -110,6 +110,10 @@ namespace DroneWorld.Stage3.Editor
             EditorUtility.SetDirty(asset);
             AssetDatabase.SaveAssets();
             Stage3SceneBuilder.BuildPlaybackScene(assetPath);
+            asset = AssetDatabase.LoadAssetAtPath<Stage3TrackAsset>(assetPath);
+            if (asset == null)
+                throw new InvalidDataException(
+                    $"Unity could not reload the Stage 3 track asset '{assetPath}'.");
             Debug.Log(
                 $"Imported passing Stage 3 bundle: {bundleRoot}; " +
                 $"tracks={asset.Tracks.Length}; confidence={asset.ScaleConfidence}");
