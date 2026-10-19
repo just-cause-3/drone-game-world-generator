@@ -100,12 +100,15 @@ namespace DroneWorld.Stage2.Editor
             asset.WorldBoundsMax = new Vector2(
                 data.world_bounds.max_x, data.world_bounds.max_z);
             EditorUtility.SetDirty(asset);
-            AssetDatabase.SaveAssets();
-
-            Stage2SceneBuilder.BuildMetricScene(assetPath);
             manifest.HasMetricCalibration = true;
             EditorUtility.SetDirty(manifest);
             AssetDatabase.SaveAssets();
+
+            Stage2SceneBuilder.BuildMetricScene(assetPath);
+            asset = AssetDatabase.LoadAssetAtPath<Stage2CalibrationAsset>(assetPath);
+            if (asset == null)
+                throw new InvalidDataException(
+                    $"Unity could not reload the Stage 2 calibration '{assetPath}'.");
             Debug.Log(
                 $"Imported passing Stage 2 calibration: {bundleRoot}; " +
                 $"confidence={data.confidence}; " +
