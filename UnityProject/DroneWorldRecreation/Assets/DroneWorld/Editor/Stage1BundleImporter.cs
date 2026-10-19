@@ -111,6 +111,13 @@ namespace DroneWorld.Stage1.Editor
             AssetDatabase.SaveAssets();
 
             Stage1SceneBuilder.BuildPreviewScene(manifestPath);
+            // Opening a new scene may unload the native object represented by the
+            // earlier C# wrapper. Return a fresh Asset Database reference so a
+            // same-call Stage 2 import never receives Unity's fake-null object.
+            manifest = AssetDatabase.LoadAssetAtPath<Stage1ArtifactManifest>(manifestPath);
+            if (manifest == null)
+                throw new InvalidDataException(
+                    $"Unity could not reload the Stage 1 manifest '{manifestPath}'.");
             Debug.Log($"Imported passing Stage 1 bundle: {bundleRoot}");
             return manifest;
         }
@@ -146,6 +153,7 @@ namespace DroneWorld.Stage1.Editor
                 { "foreground_frequency", outputs.foreground_frequency },
                 { "semantic_exclusion_mask", outputs.semantic_exclusion },
                 { "inpaint_mask", outputs.inpaint_mask },
+                { "learned_inpaint_mask", outputs.learned_inpaint_mask },
             };
             return candidates
                 .Where(pair => !string.IsNullOrWhiteSpace(pair.Value))

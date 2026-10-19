@@ -51,6 +51,12 @@ namespace DroneWorld.Stage1.Editor
                     "Python environment is missing. Create .venv and install requirements first.", python);
             if (!File.Exists(stageScript))
                 throw new FileNotFoundException("stage1.py is missing.", stageScript);
+            string inpaintModel = Path.Combine(
+                repository, "models", "inpainting_lama_2025jan.onnx");
+            if (!File.Exists(inpaintModel))
+                throw new FileNotFoundException(
+                    "Stage 1 completion model is missing. Run " +
+                    "setup_inpainting_model.py first.", inpaintModel);
 
             outputDirectory = Path.GetFullPath(outputPath);
             OutputLines.Clear();

@@ -41,6 +41,7 @@ namespace DroneWorld.Stage1.Editor
         public string foreground_frequency;
         public string semantic_exclusion;
         public string inpaint_mask;
+        public string learned_inpaint_mask;
         public string registration;
         public string video_cfr;
         public string frame_transforms;
