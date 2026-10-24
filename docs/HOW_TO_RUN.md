@@ -1,7 +1,7 @@
 # Beginner guide: install and run the drone-video-to-Unity pipeline
 
 This is the authoritative setup and run guide for the current staged project. It
-covers the existing Stage 1, Stage 2, and Stage 3 implementation. The legacy workflow
+covers the existing Stage 1, Stage 2, Stage 3, and Stage 4A implementation. The legacy workflow
 later in the repository's main README is retained only as design reference and should
 not be used with the current Unity project.
 
@@ -16,22 +16,66 @@ pipeline produces:
    coordinates. This may use an approximate width when no measurements are available.
 3. **Stage 3 — actor playback:** detected cars and people placed on the ground and
    replayed on the source video's exact frame clock.
+4. **Stage 4A — semantic review:** a provisional pixel map of roads, pavement,
+   buildings, vegetation, terrain, water, and other static content, displayed in a
+   Unity review scene and blocked from geometry until explicit operator acceptance.
 
-Stage 4, including building height, depth, and 3D building generation, is not yet part
-of this run procedure. At the end of this guide the Unity scene contains a textured
-flat ground and animated sample car/person models.
+Stage 4B–4D polygonization, building-height inference, and 3D generation are not yet
+implemented. Fixed top-down monocular footage does not contain enough parallax to
+measure building height, so later height values must remain visibly marked as assumed
+unless another source is supplied.
 
 ## Quick run checklist
 
 If the machine is already configured, the normal run is:
 
 1. Open `UnityProject/DroneWorldRecreation` in Unity `6000.5.7f1`.
-2. Run **Drone World → Run Stage 1 Pipeline...** and select the video.
-3. Run **Drone World → Run Stage 2 Metric Calibration...** and use approximate scale
-   when no measurements exist.
-4. Run **Drone World → Stage 3 → Run Stage 3 Tracking Pipeline...**.
-5. Inspect the three stages' review artifacts.
-6. In `Stage3ActorPlayback.unity`, press Play and select the playback root for controls.
+2. Select **Drone World → Run Full Pipeline (Stages 1-4A)...**.
+3. Select the video, leave the isolated run folder under `runs/`, and enter an
+   approximate image width. `40 m` is the default when no measurements exist; it is
+   an explicit scale assumption, not an estimate.
+4. Click **Run Stages 1-4A**. The command stops at the first failed quality gate and
+   imports nothing into Unity unless all four processing stages pass.
+5. Inspect all review artifacts. Accept Stage 4A only after labels are corrected.
+6. Use `Stage3ActorPlayback.unity` for playback and `Stage4SemanticReview.unity` for
+   the static semantic review.
+
+Each video gets separate artifacts at `runs/<video-name>/stage1` through `stage4`, so
+trying another clip does not overwrite the earlier `stage1_out`-style folders. A run
+folder is bound to its original video and cannot silently be reused for another one.
+
+The older per-stage menus remain available for diagnosis, manual measured Stage 2
+calibration, and rerunning only one expensive stage.
+
+### Optional balanced fast one-click run
+
+For a substantially shorter Stage 3 run without lowering aerial resolution or
+disabling tiles/TTA, select **Drone World -> Run Full Pipeline - Fast Mode (Stages
+1-4A)...**. Choose a separate folder such as `runs/crossroads_fast`, then click
+**Run Stages 1-4A - Fast**.
+
+Fast Mode performs Stage 3 detector inference on frames 0, 2, 4, and so on (and
+always the final frame). The tracker still advances on every frame, and the offline
+smoother interpolates the skipped positions, so the exported preview and Unity
+playback keep the source video's full frame rate and duration. Cars or people visible
+for only a single skipped frame can be missed; use the original maximum-accuracy menu
+when that edge case matters.
+
+The equivalent command is:
+
+```powershell
+.venv\Scripts\python.exe fast_pipeline.py sample_vids\crossroads.mp4 --run-root runs\crossroads_fast --assumed-world-width 40
+```
+
+The run-folder marker prevents an accuracy run and a fast run from overwriting each
+other. The original `full_pipeline.py` script, its Unity menu, and all per-stage menus
+remain available and keep their previous accuracy settings.
+
+If a Fast Mode run has already passed Stages 1-3 and then encounters a Stage 4
+processing error, press the fast run button again with the same video and run folder.
+It validates and reuses the passing bundles, then resumes at Stage 4. If Python has
+already completed the recovery outside Unity, use **Import Existing Passing Fast Run**
+to import all four validated bundles without rerunning processing.
 
 The rest of this document explains the one-time installation and each check in detail.
 
@@ -169,7 +213,31 @@ Expected final output includes:
 Model classes verified: pedestrian, people, bicycle, car, ...
 ```
 
-### 3.4 Verify GPU access
+### 3.4 Download and verify the Stage 1 completion model
+
+```powershell
+.\.venv\Scripts\python.exe setup_inpainting_model.py
+.\.venv\Scripts\python.exe setup_inpainting_model.py --verify-only
+```
+
+This installs the checksum-pinned OpenCV LaMa ONNX model. Stage 1 uses it only when a
+persistent car or person prevents temporal reconstruction and the missing component is
+too large for conservative OpenCV inpainting. Its pixels are synthesized estimates,
+recorded separately in `learned_inpaint_mask.png`, and must be inspected.
+
+### 3.5 Download and verify the Stage 4 aerial semantic models
+
+```powershell
+.\.venv\Scripts\python.exe setup_stage4_model.py
+.\.venv\Scripts\python.exe setup_stage4_model.py --verify-only
+```
+
+This installs a checksum-pinned OpenEarthMap Mask2Former-Swin model plus a narrowly
+scoped road specialist. OpenEarthMap owns building, pavement, vegetation, terrain and
+water. The specialist may only change a proposed pixel to `road`; its building and
+other predictions are discarded. Both models remain proposal tools, not ground truth.
+
+### 3.6 Verify GPU access
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import torch; print(torch.__version__); print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU mode')"
@@ -178,7 +246,7 @@ Model classes verified: pedestrian, people, bicycle, car, ...
 `CUDA: True` means the detector will use the NVIDIA GPU. `CUDA: False` is not a setup
 failure, but Stage 1 and especially Stage 3 will be much slower.
 
-### 3.5 Run the automated tests
+### 3.7 Run the automated tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -368,7 +436,75 @@ If `stage3_out` already contains a passing run, avoid repeating inference:
 Unity rechecks the Stage 1 report, CFR video, frame transforms, Stage 2 calibration,
 timeline, and track values before creating the playback scene.
 
-## 8. Correct order for every new video
+## 8. Run Stage 4A: create and review static semantic labels
+
+Stage 4A uses the Stage 1 clean reference ground and the Stage 2 coordinate mapping.
+It does not depend on Stage 3, so Stage 3 and Stage 4A may be rerun independently once
+Stages 1 and 2 are fixed.
+
+1. Exit Play Mode and open `Stage2MetricWorld.unity`.
+2. Select **Drone World → Stage 4 → Run Stage 4A Semantic Mapping...**.
+3. Confirm the Stage 2 calibration and leave the artifact folder ending in
+   `stage4_out`.
+4. Leave **Corrected labels (optional)** empty for the first automatic proposal.
+5. Click **Run Stage 4A**. Full-frame, overlapping-tile, and horizontal-flip consensus
+   prioritizes proposal quality over speed.
+6. On a structural pass, Unity opens:
+
+   ```text
+   Assets/Scenes/Stage4SemanticReview.unity
+   ```
+
+7. Select **Drone World - Stage 4A Semantic Review (NO GEOMETRY)** in the Hierarchy.
+   Use its Inspector to show/hide the overlay or reveal the full-resolution PNG.
+8. Compare every colored area to the original ground. In particular, check road versus
+   building, pavements, small vegetation, shadows, roofs, and image borders.
+
+Important: `"pass": true` means only that the output files and coverage are
+structurally usable. It does not mean semantic accuracy. The aerial model is a major
+domain improvement, but resolution, geography, shadows and rendered/synthetic footage
+can still differ from its training distribution. Inspect the complete overlay.
+
+The canonical label image is a one-channel PNG at exactly the Stage 1 dimensions. Each
+pixel stores one of these integer IDs:
+
+| ID | Meaning |
+|---:|---|
+| 0 | unknown / needs review |
+| 1 | road |
+| 2 | pavement / sidewalk |
+| 3 | building |
+| 4 | vegetation |
+| 5 | terrain / soil |
+| 6 | water |
+| 7 | other static object |
+
+To use a corrected map, edit/export that indexed value image in a suitable annotation
+tool without resizing it. Then choose it in **Corrected labels (optional)** and rerun
+Stage 4A. The Python pipeline validates dimensions, label IDs, valid-mask bounds,
+provenance, and artifacts before Unity imports it.
+
+Only after the overlay is correct, click **Accept Exact Semantic Map for Stage 4B** in
+the review root's Inspector. This writes `stage4_out/semantic_acceptance.json` bound to
+the exact SHA-256 of `report.json` and `semantic_labels.png`. Re-running or changing
+either file invalidates the acceptance. Acceptance does not certify heights and does
+not create geometry.
+
+Review these external artifacts:
+
+```text
+stage4_out/report.json
+stage4_out/semantic_labels.png
+stage4_out/semantic_overlay.png
+stage4_out/components.json
+stage4_out/mask_building.png
+stage4_out/mask_road.png
+```
+
+To import an existing passing proposal without inference, use **Drone World → Stage 4
+→ Import Stage 4A Semantic Proposal...** and select `stage4_out`.
+
+## 9. Correct order for every new video
 
 Run the stages consecutively in this exact order:
 
@@ -380,17 +516,19 @@ Stage 1 → stage1_out + Stage1Preview.unity
 Stage 2 → stage2_out + Stage2MetricWorld.unity
    ↓
 Stage 3 → stage3_out + Stage3ActorPlayback.unity
+   ↓
+Stage 4A → stage4_out + Stage4SemanticReview.unity
 ```
 
 Changing the source video or regenerating Stage 1 invalidates the old Stage 2 and Stage
-3 provenance. Re-run Stage 2 and Stage 3 afterward. Do not copy a `report.json`, ground
-image, calibration, or tracks file between unrelated runs; hashes intentionally prevent
-mixed bundles from being imported.
+3/4 provenance. Re-run all dependent stages afterward. Do not copy a `report.json`,
+ground image, calibration, tracks file, or semantic image between unrelated runs;
+hashes intentionally prevent mixed bundles from being imported.
 
 The default output directories can safely be reused by their own stage. Publication is
 atomic and a stage refuses to replace an unrelated non-empty directory.
 
-## 9. Optional PowerShell commands
+## 10. Optional PowerShell commands
 
 The Unity windows are recommended for beginners because they run Python, import only a
 passing result, and create the correct scene automatically. The equivalent Python
@@ -424,13 +562,26 @@ without repeating YOLO inference:
 The reuse command still validates all upstream hashes and decodes the frames again for
 appearance and diagnostic generation. It skips only the expensive detector inference.
 
+Run Stage 4A without importing it into Unity:
+
+```powershell
+.\.venv\Scripts\python.exe stage4.py stage1_out stage2_out --output stage4_out
+```
+
+Revalidate and publish an operator-corrected canonical label image without automatic
+inference:
+
+```powershell
+.\.venv\Scripts\python.exe stage4.py stage1_out stage2_out --output stage4_out --semantic-labels path\to\corrected_labels.png
+```
+
 Python exit codes are:
 
 - `0`: success and passing quality gate;
 - `1`: setup, input, or processing error;
 - `2`: completed processing but rejected by the stage's quality gate.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Unity Hub says there is no project
 
@@ -480,7 +631,7 @@ If verification fails, redownload the pinned file:
 ### CUDA is unavailable
 
 The pipeline falls back to CPU. To restore GPU execution, update the NVIDIA driver and
-install a PyTorch CUDA build compatible with that driver. Verify with section 3.4.
+install a PyTorch CUDA build compatible with that driver. Verify with section 3.5.
 
 ### Stage 1 rejects a clip
 
@@ -511,12 +662,29 @@ every video frame, so longer footage takes proportionally longer.
 One of the upstream Stage 1/2 files changed after Stage 3 was generated. Re-run the
 stages in order. Do not edit generated JSON or image artifacts manually.
 
+### Stage 4A says PASS but the labels look wrong
+
+That is an expected distinction: the automatic gate checks file integrity, provenance,
+valid label IDs, coverage, and fragmentation; it cannot prove the semantic meaning of
+each pixel. Do not click acceptance. Correct the one-channel label PNG using the IDs in
+section 8, rerun Stage 4A with that file, and inspect the new overlay.
+
+### Stage 4 model is missing
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe setup_stage4_model.py
+```
+
+If using a corrected label PNG, the automatic model is not needed for that run.
+
 ### Unity reports that scene setup cannot run during Play Mode
 
 Exit Play Mode, run the menu command, save the scene if prompted, and then enter Play
 Mode again.
 
-## 11. Final acceptance checklist
+## 12. Final acceptance checklist
 
 Before treating a run as successful, verify all of the following:
 
@@ -531,13 +699,22 @@ Before treating a run as successful, verify all of the following:
 - `track_map.png` has plausible, continuous paths without identity teleports.
 - `Stage3ActorPlayback.unity` enters Play Mode without Console errors.
 - Cars and people move on the ground at the correct video timing.
+- `stage4_out/report.json` has `"pass": true` and `"ready_for_geometry": false`.
+- `semantic_overlay.png` was checked against the original ground at full resolution.
+- Incorrect automatic labels were corrected and Stage 4A was rerun.
+- `semantic_acceptance.json` exists only if the exact current map was consciously
+  accepted for later polygonization.
+- No Stage 4 result is described as measured height or completed 3D geometry.
 
-## 12. Licensing before distribution
+## 13. Licensing before distribution
 
 Local setup and testing do not remove distribution obligations. The pinned VisDrone
 checkpoint and the Ultralytics implementation used by this project are AGPL-3.0
 licensed. Review the model, code, and eventual product distribution requirements before
-shipping a Unity build or service.
+shipping a Unity build or service. The Stage 4 OpenEarthMap model card declares MIT,
+but OpenEarthMap source-image/label licenses vary by region; the road specialist also
+uses the Ultralytics runtime. Perform a separate distribution review for all weights and
+training-data obligations.
 
 For implementation details and quality contracts, see:
 
@@ -545,3 +722,5 @@ For implementation details and quality contracts, see:
 - [`STAGE2_CONTRACT.md`](STAGE2_CONTRACT.md)
 - [`STAGE3_CONTRACT.md`](STAGE3_CONTRACT.md)
 - [`STAGE3_IMPLEMENTATION_PLAN.md`](STAGE3_IMPLEMENTATION_PLAN.md)
+- [`STAGE4_CONTRACT.md`](STAGE4_CONTRACT.md)
+- [`STAGE4_IMPLEMENTATION_PLAN.md`](STAGE4_IMPLEMENTATION_PLAN.md)
