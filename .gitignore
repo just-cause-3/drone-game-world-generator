@@ -8,6 +8,7 @@ stage1_out/
 stage2_out/
 stage3_out/
 stage4_out/
+stage4_geometry_out/
 runs/
 .stage1_out-*/
 .stage2_out-*/
@@ -38,6 +39,7 @@ sample_vids/*.mp4
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage2MetricWorld.unity*
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage3ActorPlayback.unity*
 /UnityProject/DroneWorldRecreation/Assets/Scenes/Stage4SemanticReview.unity*
+/UnityProject/DroneWorldRecreation/Assets/Scenes/Stage4GeneratedWorld.unity*
 
 # Superseded experimental Unity project retained locally for reference only.
 /UnityProject/My project/
