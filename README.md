@@ -2,13 +2,51 @@
 
 > **New user? Start here:** follow
 > [`docs/HOW_TO_RUN.md`](docs/HOW_TO_RUN.md) for the complete one-time setup and the
-> current Stage 1 → Stage 2 → Stage 3 Unity workflow. The long legacy guide later in
+> current Stage 1 → Stage 2 → Stage 3 → Stage 4A Unity workflow. The long legacy guide later in
 > this README is reference material for the reverted implementation.
 
 > **Staged rebuild status:** Stage 1 static-ground reconstruction, Stage 2 coordinate
-> calibration, and Stage 3 car/person playback are implemented in the clean Unity
-> project. Building/depth generation remains Stage 4. The older end-to-end pipeline
+> calibration, Stage 3 car/person playback, and review-gated Stage 4A semantic mapping
+> are implemented in the clean Unity project. Polygonization, height estimation, and
+> 3D geometry are the later Stage 4 substages. The older end-to-end pipeline
 > below is retained only as reference.
+
+## One-click Stage 1 → 4A run
+
+After completing the setup in [`docs/HOW_TO_RUN.md`](docs/HOW_TO_RUN.md), open the
+Unity project and select **Drone World → Run Full Pipeline (Stages 1-4A)...**. The
+window defaults to `sample_vids/remove_the_trees_and_people.mp4`, stores its artifacts
+under `runs/remove_the_trees_and_people`, and uses an explicit approximate `40 m`
+image width. It runs every Python quality gate before importing the Stage 1 ground,
+Stage 2 coordinates, Stage 3 actor playback, and Stage 4A semantic review into the
+same Unity project.
+
+This is deliberately fail-closed: a rejected stage stops all downstream work and no
+new bundles are imported into Unity. A complete run still ends at the mandatory
+Stage 4A semantic review; it does not accept labels or create 3D geometry automatically.
+
+The equivalent processing-only command is:
+
+```powershell
+.venv\Scripts\python.exe full_pipeline.py sample_vids\remove_the_trees_and_people.mp4 --run-root runs\remove_the_trees_and_people --assumed-world-width 40
+```
+
+### Separate balanced fast mode
+
+Select **Drone World -> Run Full Pipeline - Fast Mode (Stages 1-4A)...** to run the
+separate fast entry point. It keeps the 1280 px detector input, full-frame pass,
+overlapping 640 px aerial tiles, and test-time augmentation. The expensive Stage 3
+detector runs on alternate frames; tracking, interpolation, preview video, and Unity
+playback still use every frame on the original CFR clock. The normal command above
+continues to detect every frame and is unchanged.
+
+Use a separate folder ending in `_fast`, for example:
+
+```powershell
+.venv\Scripts\python.exe fast_pipeline.py sample_vids\crossroads.mp4 --run-root runs\crossroads_fast --assumed-world-width 40
+```
+
+Fast and maximum-accuracy artifacts cannot be mixed in one run folder.
 
 ## New Stage 1 — top-down video to validated ground
 
@@ -16,6 +54,7 @@ Install the pinned aerial detector once, then run:
 
 ```powershell
 .venv\Scripts\python.exe setup_drone_model.py
+.venv\Scripts\python.exe setup_inpainting_model.py
 .venv\Scripts\python.exe stage1.py path/to/stationary_top_down.mp4 --output stage1_out
 ```
 
@@ -31,8 +70,9 @@ to CFR, rejects cuts, registers minimal hover jitter to the temporal center, and
 - `stage1_out/video_cfr.*` — exact video all later stages must consume;
 - `stage1_out/valid_mask.png` — pixels supported by enough registered observations;
 - `stage1_out/temporal_variation.png` — non-semantic temporal-change diagnostic;
-- `stage1_out/foreground_frequency.png`, `semantic_exclusion_mask.png`, and
-  `inpaint_mask.png` — semantic cleanup and conservative repair evidence;
+- `stage1_out/foreground_frequency.png`, `semantic_exclusion_mask.png`,
+  `inpaint_mask.png`, and `learned_inpaint_mask.png` — semantic cleanup and exact
+  synthesized-background evidence;
 - `stage1_out/detection_preview.png` and `reference_foreground_mask.png` — the
   reference-frame boxes and exact expanded mask for mandatory visual inspection;
 - `stage1_out/frame_transforms_to_reference.npy` — one transform for every CFR frame;
@@ -113,6 +153,27 @@ Play/Pause, Reset, and timeline seeking controls. The artifact contract is docum
 roadmap remains in
 [`docs/STAGE3_IMPLEMENTATION_PLAN.md`](docs/STAGE3_IMPLEMENTATION_PLAN.md).
 
+## New Stage 4A — review-gated static semantics
+
+Stage 4A proposes a canonical pixel map for road, pavement, building, vegetation,
+terrain, water, and other static content:
+
+```powershell
+.venv\Scripts\python.exe setup_stage4_model.py
+.venv\Scripts\python.exe stage4.py stage1_out stage2_out --output stage4_out
+```
+
+In Unity, use **Drone World -> Stage 4 -> Run Stage 4A Semantic Mapping...**. A
+structural pass opens `Assets/Scenes/Stage4SemanticReview.unity`, but it never means
+the classes are correct and it does not generate 3D geometry. Automatic mode now uses
+a pinned Mask2Former-Swin checkpoint trained on OpenEarthMap aerial/satellite imagery.
+A second pinned model is narrowly allowed to promote road pixels only; it cannot
+propose buildings or replace other aerial classes. Inspect every region, supply a
+corrected canonical label PNG when necessary, and explicitly accept the exact
+hash-bound map before Stage 4B can consume it. See
+[`docs/STAGE4_IMPLEMENTATION_PLAN.md`](docs/STAGE4_IMPLEMENTATION_PLAN.md) and
+[`docs/STAGE4_CONTRACT.md`](docs/STAGE4_CONTRACT.md).
+
 ## Staged roadmap
 
 1. **Stage 1 — static ground:** validate the fixed top-down video, normalize camera
@@ -123,8 +184,9 @@ roadmap remains in
    persistent identities, transform every trajectory through the Stage 1 frame geometry
    and Stage 2 calibration, estimate direction/speed, and emit metric Unity playback.
    Trucks and other classes remain excluded under the current project policy.
-4. **Stage 4 — static scene understanding and 3D geometry:** classify roads, pavements,
-   markings, vegetation, and structures, then build appropriate Unity geometry.
+4. **Stage 4 — static scene understanding and 3D geometry:** Stage 4A now creates a
+   review-gated semantic proposal. Stage 4B polygonization, Stage 4C height hypotheses,
+   and Stage 4D Unity geometry remain deliberately blocked until semantic acceptance.
 5. **Stage 5 — integration and validation:** combine the metric static world and dynamic
    tracks, then verify timing, placement, scale, collisions, and playback behavior.
 

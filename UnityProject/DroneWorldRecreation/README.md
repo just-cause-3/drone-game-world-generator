@@ -2,8 +2,14 @@
 
 Open this folder with Unity `6000.5.7f1`.
 
+For a one-click balanced run, use **Drone World -> Run Full Pipeline - Fast Mode
+(Stages 1-4A)...** and keep its artifacts in a separate `runs/<name>_fast` folder.
+This preserves full-resolution tiled/TTA detection while Stage 3 infers alternate
+frames and reconstructs the full-rate playback timeline. The existing **Run Full
+Pipeline (Stages 1-4A)...** menu remains the maximum-accuracy, every-frame option.
+
 New users should follow [`../../docs/HOW_TO_RUN.md`](../../docs/HOW_TO_RUN.md) from the
-repository root for installation and the complete Stage 1 → Stage 3 procedure.
+repository root for installation and the complete Stage 1 → Stage 4A procedure.
 
 This is the clean Unity project for the staged rebuild. It deliberately does not reuse
 the assets, coordinate conversions, tracks, or scenes from `UnityProject/My project`.
@@ -92,6 +98,24 @@ In Current Scene** again. It upgrades the existing root instead of creating dupl
 The Stage 3 importer rechecks the Stage 1 report, CFR video, transform-stack, and Stage
 2 calibration hashes before modifying Unity. A failed or stale bundle leaves the
 previous scene unchanged.
+
+## Stage 4A semantic review workflow
+
+1. Run `setup_stage4_model.py` once from the repository root.
+2. Open the Stage 2 metric scene and select **Drone World -> Stage 4 -> Run Stage 4A
+   Semantic Mapping...**.
+3. Run automatic mode to obtain a proposal, or select a corrected canonical one-channel
+   PNG to validate and import operator labels.
+4. A structural pass opens `Assets/Scenes/Stage4SemanticReview.unity`.
+5. Select the review root, inspect the overlay at full resolution, and accept only an
+   actually corrected map.
+
+Stage 4A intentionally generates no geometry. Automatic mode uses OpenEarthMap aerial
+semantics plus a road-only specialist; the specialist cannot propose buildings.
+`pass` remains only a file/provenance/coverage gate. Acceptance is stored externally
+and bound to the exact report and semantic-label hashes.
+Changing either artifact invalidates approval. Stage 4B polygonization, height
+hypotheses, and final Unity geometry remain future substages.
 
 The editor integration has a batch-mode self-test (`DroneWorld.Stage1.Editor.Stage1UnitySelfTest.Run`)
 that imports a temporary passing fixture, verifies the mesh/UV convention, then removes
