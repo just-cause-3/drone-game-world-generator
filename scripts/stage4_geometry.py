@@ -233,3 +233,106 @@ def _load_inputs(stage4_bundle) -> dict:
         "labels_hash": labels_hash,
         "acceptance_hash": _sha256(acceptance_path),
     }
+
+
+def _project_points(homography: np.ndarray, points: np.ndarray) -> np.ndarray:
+    source = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(source, homography).reshape(-1, 2)
+    if not np.all(np.isfinite(projected)):
+        raise ValueError("a semantic boundary maps to non-finite world coordinates")
+    return projected
+
+
+def _median_metres_per_pixel(homography: np.ndarray, width: int, height: int) -> float:
+    samples = []
+    for v in np.linspace(0.0, height - 2.0, 5):
+        for u in np.linspace(0.0, width - 2.0, 5):
+            world = _project_points(homography, np.array([
+                [u, v], [u + 1.0, v], [u, v + 1.0]], dtype=np.float64))
+            samples.extend((
+                float(np.linalg.norm(world[1] - world[0])),
+                float(np.linalg.norm(world[2] - world[0])),
+            ))
+    finite = [value for value in samples if math.isfinite(value) and value > 1e-9]
+    if not finite:
+        raise ValueError("Stage 2 mapping has no usable local scale")
+    return float(np.median(finite))
+
+
+def _signed_area(points: np.ndarray) -> float:
+    x = points[:, 0]
+    y = points[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _point_in_triangle(point, a, b, c, epsilon=1e-9) -> bool:
+    def cross(p, q, r):
+        return ((q[0] - p[0]) * (r[1] - p[1]) -
+                (q[1] - p[1]) * (r[0] - p[0]))
+    c1 = cross(a, b, point)
+    c2 = cross(b, c, point)
+    c3 = cross(c, a, point)
+    return ((c1 >= -epsilon and c2 >= -epsilon and c3 >= -epsilon) or
+            (c1 <= epsilon and c2 <= epsilon and c3 <= epsilon))
+
+
+def _triangulate_polygon(points: np.ndarray) -> list[int]:
+    """Ear-clip one simple polygon and return flattened vertex indices."""
+    count = len(points)
+    if count < 3 or abs(_signed_area(points)) < 1e-8:
+        raise ValueError("polygon has fewer than three usable vertices")
+    orientation = 1.0 if _signed_area(points) > 0.0 else -1.0
+    remaining = list(range(count))
+    triangles: list[int] = []
+    guard = 0
+    while len(remaining) > 3:
+        ear_found = False
+        for offset, current in enumerate(remaining):
+            previous = remaining[offset - 1]
+            following = remaining[(offset + 1) % len(remaining)]
+            a, b, c = points[previous], points[current], points[following]
+            first = b - a
+            second = c - b
+            cross = float(first[0] * second[1] - first[1] * second[0])
+            if orientation * cross <= 1e-10:
+                continue
+            if any(
+                    _point_in_triangle(points[index], a, b, c)
+                    for index in remaining
+                    if index not in {previous, current, following}):
+                continue
+            triangles.extend((previous, current, following))
+            del remaining[offset]
+            ear_found = True
+            break
+        guard += 1
+        if not ear_found or guard > count * count:
+            raise ValueError("polygon triangulation failed; boundary may be self-intersecting")
+    triangles.extend(remaining)
+    return triangles
+
+
+def _simplify_contour(contour: np.ndarray, tolerance_px: float,
+                      maximum_vertices: int) -> np.ndarray:
+    epsilon = max(0.5, tolerance_px)
+    simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+    for _ in range(12):
+        if len(simplified) <= maximum_vertices:
+            break
+        epsilon *= 1.4
+        simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+    if len(simplified) < 3 or len(simplified) > maximum_vertices:
+        raise ValueError(
+            f"could not simplify polygon to 3..{maximum_vertices} vertices")
+    return simplified.astype(np.float64)
+
+
+def _assumed_height(area_m2: float, options: Stage4GeometryOptions) -> tuple[float, str]:
+    if options.height_policy == "fixed":
+        height = options.default_building_height_m
+        source = "operator_configured_fixed_assumption"
+    else:
+        floors = max(1, int(round(math.sqrt(max(area_m2, 1.0)) / 7.0)))
+        height = floors * options.floor_height_m
+        source = "footprint_area_prior_assumption"
+    return min(height, options.maximum_assumed_height_m), source
