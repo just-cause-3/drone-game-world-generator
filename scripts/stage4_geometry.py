@@ -116,3 +116,120 @@ def _required_dict(value, label: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{label} is missing or invalid")
     return value
+
+
+def _load_inputs(stage4_bundle) -> dict:
+    stage4_root = Path(stage4_bundle).resolve()
+    report_path = stage4_root / "report.json"
+    acceptance_path = stage4_root / "semantic_acceptance.json"
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Stage 4A report not found: {report_path}")
+    if not acceptance_path.is_file():
+        raise FileNotFoundError(
+            "Stage 4B is blocked until Unity writes semantic_acceptance.json")
+
+    report = _read_json(report_path)
+    if (report.get("schema_version") != STAGE4A_SCHEMA or
+            report.get("stage") != 4 or
+            report.get("substage") != "semantic_proposal"):
+        raise ValueError("the selected directory is not a Stage 4A semantic bundle")
+    if report.get("pass") is not True:
+        raise ValueError("Stage 4B refuses a failed Stage 4A proposal")
+    if report.get("requires_human_review") is not True:
+        raise ValueError("Stage 4A report does not preserve the human-review gate")
+
+    outputs = _required_dict(report.get("outputs"), "Stage 4A outputs")
+    hashes = _required_dict(report.get("artifact_hashes"), "Stage 4A hashes")
+    labels_path = _resolve_artifact(
+        stage4_root, outputs.get("semantic_labels"), "semantic labels")
+    labels_hash = _sha256(labels_path)
+    if labels_hash.lower() != str(hashes.get("semantic_labels_sha256", "")).lower():
+        raise ValueError("Stage 4A semantic label hash does not match its report")
+
+    acceptance = _read_json(acceptance_path)
+    if (acceptance.get("schema_version") != ACCEPTANCE_SCHEMA or
+            acceptance.get("stage") != 4):
+        raise ValueError("semantic acceptance record has the wrong schema")
+    if acceptance.get("accepted") is not True:
+        raise ValueError("Stage 4A semantic acceptance was revoked")
+    report_hash = _sha256(report_path)
+    if str(acceptance.get("stage4_report_sha256", "")).lower() != report_hash:
+        raise ValueError("semantic acceptance is stale: Stage 4A report changed")
+    if str(acceptance.get("semantic_labels_sha256", "")).lower() != labels_hash:
+        raise ValueError("semantic acceptance is stale: label image changed")
+
+    source1 = _required_dict(report.get("source_stage1"), "Stage 4A Stage 1 source")
+    source2 = _required_dict(report.get("source_stage2"), "Stage 4A Stage 2 source")
+    stage1_root = Path(str(source1.get("bundle_path", ""))).resolve()
+    stage2_root = Path(str(source2.get("bundle_path", ""))).resolve()
+    stage1_report_path = stage1_root / "report.json"
+    calibration_path = stage2_root / "world_calibration.json"
+    if not stage1_report_path.is_file() or not calibration_path.is_file():
+        raise FileNotFoundError("an upstream Stage 1 or Stage 2 bundle is missing")
+    if _sha256(stage1_report_path).lower() != str(
+            source1.get("report_sha256", "")).lower():
+        raise ValueError("Stage 1 report changed after Stage 4A")
+    if _sha256(calibration_path).lower() != str(
+            source2.get("calibration_sha256", "")).lower():
+        raise ValueError("Stage 2 calibration changed after Stage 4A")
+
+    stage1 = _read_json(stage1_report_path)
+    calibration = _read_json(calibration_path)
+    if (stage1.get("schema_version") != "stage1-ground-v1" or
+            stage1.get("pass") is not True):
+        raise ValueError("Stage 4B requires a passing Stage 1 bundle")
+    if (calibration.get("schema_version") != "stage2-calibration-v1" or
+            calibration.get("pass") is not True):
+        raise ValueError("Stage 4B requires a passing Stage 2 calibration")
+    try:
+        width = int(source1["pixel_width"])
+        height = int(source1["pixel_height"])
+        homography = np.asarray(
+            calibration["reference_pixel_to_world_xz"], dtype=np.float64)
+        ground_relative = stage1["outputs"]["ground"]
+    except (KeyError, TypeError, ValueError) as exception:
+        raise ValueError("upstream geometry provenance is incomplete") from exception
+    if width < 2 or height < 2 or homography.shape != (3, 3):
+        raise ValueError("upstream dimensions or homography are invalid")
+    if not np.all(np.isfinite(homography)):
+        raise ValueError("Stage 2 homography contains non-finite values")
+
+    labels = cv2.imread(str(labels_path), cv2.IMREAD_UNCHANGED)
+    if labels is None or labels.ndim != 2 or labels.shape != (height, width):
+        raise ValueError("semantic labels are unreadable or dimensionally inconsistent")
+    if int(labels.min()) < 0 or int(labels.max()) >= len(CANONICAL_CLASSES):
+        raise ValueError("semantic labels contain an unsupported class ID")
+
+    ground_path = _resolve_artifact(stage1_root, ground_relative, "Stage 1 ground")
+    if _sha256(ground_path).lower() != str(source1.get("ground_sha256", "")).lower():
+        raise ValueError("Stage 1 ground changed after Stage 4A")
+    ground = cv2.imread(str(ground_path), cv2.IMREAD_COLOR)
+    if ground is None or ground.shape[:2] != (height, width):
+        raise ValueError("Stage 1 ground is unreadable or dimensionally inconsistent")
+
+    coordinate = _required_dict(
+        calibration.get("coordinate_system"), "Stage 2 coordinate system")
+    return {
+        "stage4_root": stage4_root,
+        "stage4_report": report,
+        "stage4_report_path": report_path,
+        "acceptance_path": acceptance_path,
+        "labels_path": labels_path,
+        "labels": labels.astype(np.uint8, copy=False),
+        "ground": ground,
+        "stage1_root": stage1_root,
+        "stage1_report_path": stage1_report_path,
+        "stage2_root": stage2_root,
+        "calibration_path": calibration_path,
+        "calibration": calibration,
+        "homography": homography,
+        "width": width,
+        "height": height,
+        "ground_y": float(coordinate.get("ground_y_m", 0.0)),
+        "metric_scale_is_assumed": bool(
+            coordinate.get("metric_scale_is_assumed", False)),
+        "scale_confidence": str(calibration.get("confidence", "unknown")),
+        "report_hash": report_hash,
+        "labels_hash": labels_hash,
+        "acceptance_hash": _sha256(acceptance_path),
+    }
