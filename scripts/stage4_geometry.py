@@ -336,3 +336,109 @@ def _assumed_height(area_m2: float, options: Stage4GeometryOptions) -> tuple[flo
         height = floors * options.floor_height_m
         source = "footprint_area_prior_assumption"
     return min(height, options.maximum_assumed_height_m), source
+
+
+def _extract_buildings(labels: np.ndarray, homography: np.ndarray,
+                       metres_per_pixel: float,
+                       options: Stage4GeometryOptions) -> tuple[list[dict], list[str]]:
+    mask = (labels == CANONICAL_IDS["building"]).astype(np.uint8)
+    contours, hierarchy = cv2.findContours(
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return [], []
+    hierarchy = hierarchy[0]
+    candidates = []
+    warnings = []
+    tolerance_px = options.simplify_tolerance_m / metres_per_pixel
+    for index, contour in enumerate(contours):
+        if hierarchy[index][3] != -1:
+            continue
+        # A global median pixel scale is not a bound on local projective area.
+        # Filter in world coordinates so distant/nearby regions are not lost.
+        if len(contour) < 3 or cv2.contourArea(contour) <= 0:
+            continue
+        source_world = _project_points(homography, contour.reshape(-1, 2))
+        if abs(_signed_area(source_world)) < options.minimum_building_area_m2:
+            continue
+        try:
+            pixels = _simplify_contour(
+                contour, tolerance_px, options.maximum_polygon_vertices)
+        except ValueError:
+            warnings.append("Skipped a building contour that could not form a valid polygon; review its boundary.")
+            continue
+        world = _project_points(homography, pixels)
+        area_m2 = abs(_signed_area(world))
+        if area_m2 < options.minimum_building_area_m2:
+            continue
+        triangles = _triangulate_polygon(world)
+        moments = cv2.moments(contour)
+        if abs(moments["m00"]) > 1e-9:
+            centroid_pixel = np.array([[moments["m10"] / moments["m00"],
+                                        moments["m01"] / moments["m00"]]])
+        else:
+            centroid_pixel = np.mean(pixels, axis=0, keepdims=True)
+        centroid_world = _project_points(homography, centroid_pixel)[0]
+        child = hierarchy[index][2]
+        hole_count = 0
+        while child != -1:
+            hole_count += 1
+            child = hierarchy[child][0]
+        if hole_count:
+            warnings.append(
+                f"Building component near ({centroid_pixel[0, 0]:.1f}, "
+                f"{centroid_pixel[0, 1]:.1f}) has {hole_count} interior hole(s); "
+                "the provisional roof fills them.")
+        height, height_source = _assumed_height(area_m2, options)
+        bounds = cv2.boundingRect(contour)
+        candidates.append({
+            "sort": (bounds[1], bounds[0]),
+            "area_m2": area_m2,
+            "height_m": height,
+            "height_source": height_source,
+            "height_is_assumed": True,
+            "footprint_pixel": pixels,
+            "footprint_world": world,
+            "roof_triangles": triangles,
+            "centroid_pixel": centroid_pixel[0],
+            "centroid_world": centroid_world,
+            "source_bounds_px": bounds,
+            "source_hole_count": hole_count,
+        })
+    candidates.sort(key=lambda item: item["sort"])
+    if len(candidates) > options.maximum_buildings:
+        raise ValueError(
+            f"accepted map contains {len(candidates)} building polygons; limit is "
+            f"{options.maximum_buildings}")
+    result = []
+    for number, item in enumerate(candidates, start=1):
+        x, y, width, height = item["source_bounds_px"]
+        result.append({
+            "id": f"building_{number:04d}",
+            "class_id": CANONICAL_IDS["building"],
+            "area_m2": round(item["area_m2"], 4),
+            "height_m": round(item["height_m"], 4),
+            "height_source": item["height_source"],
+            "height_is_assumed": True,
+            "footprint_pixel": [
+                {"u": round(float(point[0]), 4), "v": round(float(point[1]), 4)}
+                for point in item["footprint_pixel"]
+            ],
+            "footprint_xz": [
+                {"x": round(float(point[0]), 6), "z": round(float(point[1]), 6)}
+                for point in item["footprint_world"]
+            ],
+            "roof_triangles": item["roof_triangles"],
+            "centroid_pixel": {
+                "u": round(float(item["centroid_pixel"][0]), 4),
+                "v": round(float(item["centroid_pixel"][1]), 4),
+            },
+            "centroid_xz": {
+                "x": round(float(item["centroid_world"][0]), 6),
+                "z": round(float(item["centroid_world"][1]), 6),
+            },
+            "source_bounds_px": {
+                "x": int(x), "y": int(y), "width": int(width), "height": int(height),
+            },
+            "source_hole_count": item["source_hole_count"],
+        })
+    return result, warnings
