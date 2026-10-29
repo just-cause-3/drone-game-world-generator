@@ -570,3 +570,135 @@ def _validate_output_target(output: Path) -> None:
 def _publish_directory(temporary: Path, output: Path) -> None:
     _validate_output_target(output)
     publish_directory(temporary, output)
+
+
+def run_stage4_geometry(stage4_bundle, output_directory="stage4_geometry_out",
+                        options: Stage4GeometryOptions | None = None) -> dict:
+    options = options or Stage4GeometryOptions()
+    options.validate()
+    inputs = _load_inputs(stage4_bundle)
+    output = Path(output_directory).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _validate_output_target(output)
+
+    metres_per_pixel = _median_metres_per_pixel(
+        inputs["homography"], inputs["width"], inputs["height"])
+    buildings, warnings = _extract_buildings(
+        inputs["labels"], inputs["homography"], metres_per_pixel, options)
+    surfaces = _extract_surface_regions(
+        inputs["labels"], inputs["homography"], metres_per_pixel, options)
+    trees = _extract_tree_proxies(
+        inputs["labels"], inputs["homography"], metres_per_pixel, options)
+    if inputs["metric_scale_is_assumed"]:
+        warnings.append(
+            "Stage 2 scale is assumed; every generated horizontal dimension and "
+            "height is provisional.")
+    warnings.append(
+        "Building heights are explicit assumptions; stationary top-down monocular "
+        "footage does not provide physical height evidence.")
+    warnings.append(
+        "Visible roof boundaries are used as provisional footprints and may not match "
+        "ground-level walls or roof overhangs.")
+    if not buildings:
+        warnings.append("No accepted building region exceeded the minimum area.")
+    if options.generate_vegetation_proxies:
+        warnings.append(
+            "Vegetation proxies are spacing-based placeholders, not detected trunks.")
+
+    geometry = {
+        "schema_version": GEOMETRY_SCHEMA,
+        "stage": 4,
+        "substage": "accepted_geometry",
+        "coordinate_system": {
+            "space": "unity_world_xz",
+            "horizontal_units": "metres",
+            "vertical_axis": "unity_y",
+            "ground_y_m": inputs["ground_y"],
+            "scale_confidence": inputs["scale_confidence"],
+            "metric_scale_is_assumed": inputs["metric_scale_is_assumed"],
+        },
+        "height_policy": {
+            "name": options.height_policy,
+            "all_heights_are_assumed": True,
+            "default_building_height_m": options.default_building_height_m,
+            "floor_height_m": options.floor_height_m,
+            "maximum_assumed_height_m": options.maximum_assumed_height_m,
+        },
+        "buildings": buildings,
+        "surface_regions": surfaces,
+        "vegetation_proxies": trees,
+    }
+
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{output.name}-", dir=str(output.parent)))
+    try:
+        (temporary / OUTPUT_MARKER).write_text(
+            GEOMETRY_SCHEMA + "\n", encoding="utf-8")
+        geometry_path = temporary / "geometry.json"
+        overlay_path = temporary / "geometry_overlay.png"
+        geometry_path.write_text(
+            json.dumps(geometry, indent=2) + "\n", encoding="utf-8")
+        overlay = _draw_geometry_overlay(
+            inputs["ground"], buildings, trees, inputs["homography"])
+        if not cv2.imwrite(str(overlay_path), overlay):
+            raise OSError(f"could not write geometry overlay: {overlay_path}")
+        report = {
+            "schema_version": GEOMETRY_SCHEMA,
+            "stage": 4,
+            "substage": "accepted_geometry",
+            "pass": True,
+            "ready_for_unity_geometry": True,
+            "failure_reasons": [],
+            "warnings": warnings,
+            "source_stage4a": {
+                "bundle_path": str(inputs["stage4_root"]),
+                "report_sha256": inputs["report_hash"],
+                "semantic_labels_sha256": inputs["labels_hash"],
+                "acceptance_sha256": inputs["acceptance_hash"],
+            },
+            "source_stage2": {
+                "bundle_path": str(inputs["stage2_root"]),
+                "calibration_sha256": _sha256(inputs["calibration_path"]),
+                "confidence": inputs["scale_confidence"],
+                "metric_scale_is_assumed": inputs["metric_scale_is_assumed"],
+            },
+            "quality": {
+                "metres_per_pixel_median": round(metres_per_pixel, 9),
+                "building_count": len(buildings),
+                "building_vertex_count": sum(
+                    len(item["footprint_xz"]) for item in buildings),
+                "surface_region_count": len(surfaces),
+                "vegetation_proxy_count": len(trees),
+                "assumed_height_count": len(buildings) + len(trees),
+            },
+            "options": asdict(options),
+            "outputs": {
+                "report": "report.json",
+                "geometry": "geometry.json",
+                "geometry_overlay": "geometry_overlay.png",
+            },
+            "artifact_hashes": {
+                "geometry_sha256": _sha256(geometry_path),
+                "geometry_overlay_sha256": _sha256(overlay_path),
+            },
+            "limitations": [
+                "No physical height is recovered from stationary nadir footage.",
+                "Building roof outlines are provisional wall footprints.",
+                "Surface-region boundaries are vector references; the Stage 2 ground "
+                "remains the authoritative collision surface.",
+                "Geometry must be visually reviewed in Unity before use.",
+            ],
+        }
+        (temporary / "report.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _publish_directory(temporary, output)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+
+    log(
+        "stage4b",
+        f"PASS: buildings={len(buildings)}; surfaces={len(surfaces)}; "
+        f"vegetation proxies={len(trees)} -> {output}")
+    return report
