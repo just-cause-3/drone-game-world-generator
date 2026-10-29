@@ -442,3 +442,84 @@ def _extract_buildings(labels: np.ndarray, homography: np.ndarray,
             "source_hole_count": item["source_hole_count"],
         })
     return result, warnings
+
+
+def _extract_surface_regions(labels: np.ndarray, homography: np.ndarray,
+                             metres_per_pixel: float,
+                             options: Stage4GeometryOptions) -> list[dict]:
+    tolerance_px = options.simplify_tolerance_m / metres_per_pixel
+    regions = []
+    for class_id, class_name in enumerate(CANONICAL_CLASSES[1:], start=1):
+        if class_name == "building":
+            continue
+        mask = (labels == class_id).astype(np.uint8)
+        contours, hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            continue
+        class_regions = []
+        for contour in contours:
+            if len(contour) < 3 or cv2.contourArea(contour) <= 0:
+                continue
+            source_world = _project_points(homography, contour.reshape(-1, 2))
+            if abs(_signed_area(source_world)) < options.minimum_surface_area_m2:
+                continue
+            try:
+                pixels = _simplify_contour(
+                    contour, tolerance_px, options.maximum_polygon_vertices)
+            except ValueError:
+                continue
+            world = _project_points(homography, pixels)
+            area = abs(_signed_area(world))
+            if area < options.minimum_surface_area_m2:
+                continue
+            bounds = cv2.boundingRect(contour)
+            class_regions.append((bounds[1], bounds[0], {
+                "area_m2": round(area, 4),
+                "boundary_xz": [
+                    {"x": round(float(point[0]), 6),
+                     "z": round(float(point[1]), 6)}
+                    for point in world
+                ],
+            }))
+        class_regions.sort(key=lambda item: (item[0], item[1]))
+        for number, (_, __, region) in enumerate(class_regions, start=1):
+            region.update({
+                "id": f"{class_name}_{number:04d}",
+                "class_id": class_id,
+                "class_name": class_name,
+            })
+            regions.append(region)
+    return regions
+
+
+def _extract_tree_proxies(labels: np.ndarray, homography: np.ndarray,
+                          metres_per_pixel: float,
+                          options: Stage4GeometryOptions) -> list[dict]:
+    if not options.generate_vegetation_proxies or options.maximum_trees == 0:
+        return []
+    mask = (labels == CANONICAL_IDS["vegetation"]).astype(np.uint8)
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    suppression_px = max(1, int(round(options.tree_spacing_m / metres_per_pixel)))
+    candidates = []
+    working = distance.copy()
+    while len(candidates) < options.maximum_trees:
+        _, radius_px, _, location = cv2.minMaxLoc(working)
+        radius_m = float(radius_px) * metres_per_pixel
+        if radius_m < options.minimum_tree_radius_m:
+            break
+        u, v = location
+        world = _project_points(
+            homography, np.array([[float(u), float(v)]], dtype=np.float64))[0]
+        radius_m = min(radius_m, options.maximum_tree_radius_m)
+        candidates.append((v, u, world, radius_m))
+        cv2.circle(working, (u, v), suppression_px, 0.0, -1)
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [{
+        "id": f"vegetation_{index:04d}",
+        "x": round(float(item[2][0]), 6),
+        "z": round(float(item[2][1]), 6),
+        "canopy_radius_m": round(item[3], 4),
+        "height_m": round(max(2.5, min(10.0, item[3] * 2.5)), 4),
+        "dimensions_are_assumed": True,
+    } for index, item in enumerate(candidates, start=1)]
