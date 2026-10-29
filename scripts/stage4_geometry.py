@@ -523,3 +523,50 @@ def _extract_tree_proxies(labels: np.ndarray, homography: np.ndarray,
         "height_m": round(max(2.5, min(10.0, item[3] * 2.5)), 4),
         "dimensions_are_assumed": True,
     } for index, item in enumerate(candidates, start=1)]
+
+
+def _draw_geometry_overlay(ground: np.ndarray, buildings: list[dict],
+                           trees: list[dict], homography: np.ndarray) -> np.ndarray:
+    overlay = ground.copy()
+    for building in buildings:
+        points = np.array([
+            [item["u"], item["v"]] for item in building["footprint_pixel"]
+        ], dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(overlay, [points], True,
+                      CANONICAL_COLORS_BGR[CANONICAL_IDS["building"]], 2,
+                      cv2.LINE_AA)
+        centre = building["centroid_pixel"]
+        cv2.putText(overlay, building["id"],
+                    (int(centre["u"]), int(centre["v"])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+    inverse = np.linalg.inv(homography)
+    for tree in trees:
+        pixel = _project_points(
+            inverse, np.array([[tree["x"], tree["z"]]], dtype=np.float64))[0]
+        cv2.circle(overlay, (int(round(pixel[0])), int(round(pixel[1]))),
+                   4, CANONICAL_COLORS_BGR[CANONICAL_IDS["vegetation"]], 1,
+                   cv2.LINE_AA)
+    cv2.rectangle(overlay, (8, 8), (330, 64), (15, 15, 15), -1)
+    cv2.putText(overlay, "STAGE 4B/C - PROVISIONAL GEOMETRY", (18, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.47, (255, 255, 255), 1,
+                cv2.LINE_AA)
+    cv2.putText(overlay,
+                f"buildings={len(buildings)}  vegetation proxies={len(trees)}",
+                (18, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return overlay
+
+
+def _validate_output_target(output: Path) -> None:
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Stage 4 geometry output is not a directory: {output}")
+    if (output.exists() and any(output.iterdir()) and
+            not (output / OUTPUT_MARKER).is_file()):
+        raise ValueError(
+            f"refusing to replace unrelated non-empty directory: {output}")
+
+
+def _publish_directory(temporary: Path, output: Path) -> None:
+    _validate_output_target(output)
+    publish_directory(temporary, output)
