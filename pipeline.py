@@ -17,6 +17,7 @@ from scripts.stage4_semantics import (
     Stage4Options,
     run_stage4_semantics,
 )
+from scripts.stage4_geometry import Stage4GeometryOptions, run_stage4_geometry
 from scripts.unity_stage1 import import_stage1_bundle
 
 
@@ -90,6 +91,21 @@ def _stage4_parser(subparsers):
     return parser
 
 
+def _stage4b_parser(subparsers):
+    parser = subparsers.add_parser(
+        "stage4b",
+        help="accepted Stage 4A semantic map -> provisional Unity geometry")
+    parser.add_argument("stage4_bundle", help="accepted Stage 4A artifact directory")
+    parser.add_argument("--output", default="stage4_geometry_out")
+    parser.add_argument(
+        "--height-policy", choices=("fixed", "footprint_prior"), default="fixed")
+    parser.add_argument("--building-height", type=float, default=8.0)
+    parser.add_argument("--minimum-building-area", type=float, default=6.0)
+    parser.add_argument("--simplify-tolerance", type=float, default=0.25)
+    parser.add_argument("--generate-vegetation", action="store_true")
+    return parser
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -97,6 +113,7 @@ def main(argv=None):
     _stage2_parser(subparsers)
     _stage3_parser(subparsers)
     _stage4_parser(subparsers)
+    _stage4b_parser(subparsers)
     args = parser.parse_args(argv)
 
     if args.command == "stage1":
@@ -208,6 +225,29 @@ def main(argv=None):
             "pipeline",
             f"PASS: Stage 4A labelled {quality['known_valid_area_pct']:.2f}% "
             "of valid pixels; operator review remains required")
+        for warning in report["warnings"]:
+            log("pipeline", f"WARNING: {warning}")
+        return 0
+
+    if args.command == "stage4b":
+        options = Stage4GeometryOptions(
+            height_policy=args.height_policy,
+            default_building_height_m=args.building_height,
+            minimum_building_area_m2=args.minimum_building_area,
+            simplify_tolerance_m=args.simplify_tolerance,
+            generate_vegetation_proxies=args.generate_vegetation,
+        )
+        try:
+            report = run_stage4_geometry(
+                args.stage4_bundle, args.output, options)
+        except Exception as exception:
+            print(f"FATAL: Stage 4B geometry error: {exception}", file=sys.stderr)
+            return 1
+        quality = report["quality"]
+        log(
+            "pipeline",
+            f"PASS: Stage 4B/C generated {quality['building_count']} provisional "
+            f"buildings and {quality['vegetation_proxy_count']} vegetation proxies")
         for warning in report["warnings"]:
             log("pipeline", f"WARNING: {warning}")
         return 0
