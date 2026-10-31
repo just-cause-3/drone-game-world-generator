@@ -153,6 +153,29 @@ class Stage4GeometryTests(unittest.TestCase):
             report["artifact_hashes"]["geometry_sha256"],
             sha256(output / "geometry.json"))
 
+    def test_missing_acceptance_is_rejected(self):
+        stage4 = self.make_accepted_bundle()
+        (stage4 / "semantic_acceptance.json").unlink()
+
+        with self.assertRaisesRegex(FileNotFoundError, "blocked"):
+            run_stage4_geometry(stage4, self.root / "geometry")
+
+    def test_revoked_acceptance_is_rejected(self):
+        stage4 = self.make_accepted_bundle(accepted=False)
+
+        with self.assertRaisesRegex(ValueError, "revoked"):
+            run_stage4_geometry(stage4, self.root / "geometry")
+
+    def test_stale_acceptance_is_rejected(self):
+        stage4 = self.make_accepted_bundle()
+        labels = cv2.imread(
+            str(stage4 / "semantic_labels.png"), cv2.IMREAD_UNCHANGED)
+        labels[50, 50] = CANONICAL_IDS["terrain"]
+        cv2.imwrite(str(stage4 / "semantic_labels.png"), labels)
+
+        with self.assertRaisesRegex(ValueError, "hash|stale"):
+            run_stage4_geometry(stage4, self.root / "geometry")
+
 
 if __name__ == "__main__":
     unittest.main()
