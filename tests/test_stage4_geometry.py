@@ -176,6 +176,54 @@ class Stage4GeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hash|stale"):
             run_stage4_geometry(stage4, self.root / "geometry")
 
+    def test_footprint_prior_is_explicitly_assumed(self):
+        stage4 = self.make_accepted_bundle()
+        options = Stage4GeometryOptions(height_policy="footprint_prior")
+
+        run_stage4_geometry(stage4, self.root / "geometry", options)
+
+        geometry = json.loads(
+            (self.root / "geometry" / "geometry.json").read_text(encoding="utf-8"))
+        building = geometry["buildings"][0]
+        self.assertEqual(building["height_source"], "footprint_area_prior_assumption")
+        self.assertTrue(geometry["height_policy"]["all_heights_are_assumed"])
+
+    def test_vegetation_proxies_are_opt_in_and_bounded(self):
+        stage4 = self.make_accepted_bundle()
+        options = Stage4GeometryOptions(
+            generate_vegetation_proxies=True, maximum_trees=3)
+
+        report = run_stage4_geometry(stage4, self.root / "geometry", options)
+
+        self.assertGreater(report["quality"]["vegetation_proxy_count"], 0)
+        self.assertLessEqual(report["quality"]["vegetation_proxy_count"], 3)
+
+    def test_refuses_to_replace_unrelated_directory(self):
+        stage4 = self.make_accepted_bundle()
+        output = self.root / "unrelated"
+        output.mkdir()
+        (output / "keep.txt").write_text("user data", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "unrelated"):
+            run_stage4_geometry(stage4, output)
+        self.assertEqual(
+            (output / "keep.txt").read_text(encoding="utf-8"), "user data")
+
+    def test_pipeline_stage4b_command_reports_generated_counts(self):
+        with patch("pipeline.run_stage4_geometry") as run_mock:
+            run_mock.return_value = {
+                "quality": {
+                    "building_count": 3,
+                    "vegetation_proxy_count": 0,
+                },
+                "warnings": ["heights are assumed"],
+            }
+            result = pipeline.main([
+                "stage4b", "stage4_out", "--output", "geometry_out",
+            ])
+        self.assertEqual(result, 0)
+        run_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
