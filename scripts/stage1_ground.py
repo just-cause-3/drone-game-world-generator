@@ -1,7 +1,7 @@
 """Stage 1 ground extraction for stationary, nadir/top-down drone footage.
 
-This intentionally does not perform object detection, world scaling, 3D inference, or
-Unity deployment.  It registers a bounded amount of camera drift directly to one
+This uses actor detection for foreground masking, but does not perform world scaling,
+3D inference, or Unity deployment. It registers bounded camera drift directly to one
 reference frame, builds a temporal-median static background, and emits diagnostics that
 prove whether the input satisfies this stage's assumptions.
 """
@@ -114,6 +114,9 @@ class Stage1Options:
     residual_repair_passes: int = 2
 
     def validate(self):
+        for name, value in asdict(self).items():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.sample_frames < 5:
             raise ValueError("sample_frames must be at least 5")
         if self.tile < 32:
@@ -719,15 +722,17 @@ def _reference_slot(frames: np.memmap, blur_threshold: float) -> int:
     return max(candidates, key=lambda i: _sharpness(np.asarray(frames[i])))
 
 
-def _features(frame: np.ndarray, options: Stage1Options):
+def _features(frame: np.ndarray, options: Stage1Options, foreground_mask=None):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.ORB_create(options.orb_features).detectAndCompute(gray, None)
+    keep = None if foreground_mask is None else np.where(
+        foreground_mask > 0, 0, 255).astype(np.uint8)
+    return cv2.ORB_create(options.orb_features).detectAndCompute(gray, keep)
 
 
 def _registration(frame: np.ndarray, reference: np.ndarray, options: Stage1Options,
-                  reference_features=None):
+                  reference_features=None, foreground_mask=None):
     """Estimate a constrained similarity transform from frame -> reference."""
-    kp, desc = _features(frame, options)
+    kp, desc = _features(frame, options, foreground_mask)
     ref_kp, ref_desc = reference_features or _features(reference, options)
     if desc is None or ref_desc is None:
         return None, {"accepted": False, "reason": "insufficient_features"}
@@ -994,7 +999,6 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         normalized_sharpness = np.full(len(indices), np.nan, np.float64)
         reference_slot = _reference_slot(frames, options.blur_threshold)
         reference = np.asarray(frames[reference_slot]).copy()
-        reference_features = _features(reference, options)
         masker = _YoloForegroundMasker(options) if options.foreground_model else None
         # The 92 MB ONNX graph is expensive to parse; load it only when temporal
         # reconstruction actually leaves a component too large for classical repair.
@@ -1005,14 +1009,23 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         detected_classes = Counter()
         reference_detections = []
         reference_foreground_mask = np.zeros((height, width), np.uint8)
+        if masker:
+            reference_foreground_mask, reference_detections = masker.mask(reference)
+        reference_features = _features(reference, options, reference_foreground_mask)
 
         for slot, frame_number in enumerate(indices):
             source_frame = np.asarray(frames[slot]).copy()
+            actor_mask = np.zeros((height, width), np.uint8)
+            detections = []
+            if slot == reference_slot:
+                actor_mask, detections = reference_foreground_mask, reference_detections
+            elif masker:
+                actor_mask, detections = masker.mask(source_frame)
             if slot == reference_slot:
                 H, metrics = np.eye(3, dtype=np.float64), _identity_metrics()
             else:
                 H, metrics = _registration(source_frame, reference, options,
-                                           reference_features)
+                                           reference_features, actor_mask)
             metrics["sample_slot"] = slot
             metrics["video_frame"] = int(frame_number)
             metrics["time_s"] = round(float(frame_number / fps), 4)
@@ -1023,14 +1036,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
                 continue
             transforms[slot] = H
             accepted[slot] = True
-            actor_mask = np.zeros((height, width), np.uint8)
-            detections = []
-            if masker:
-                actor_mask, detections = masker.mask(source_frame)
-                detected_classes.update(detection["class"] for detection in detections)
-                if slot == reference_slot:
-                    reference_detections = detections
-                    reference_foreground_mask = actor_mask.copy()
+            detected_classes.update(detection["class"] for detection in detections)
             metrics["foreground_detections"] = len(detections)
             metrics["foreground_by_class"] = dict(sorted(Counter(
                 detection["class"] for detection in detections).items()))
@@ -1274,6 +1280,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
                 "sharpness_retention_median_pct": round(
                     float(np.median(sharpness_retention)), 3),
                 "normalization_interpolation": "lanczos4",
+                "registration_excludes_detected_foreground": masker is not None,
                 "frame_geometry": audit_summary,
                 "max_corner_motion_pct": round(max_motion, 3),
                 "max_center_motion_pct": round(max_center_motion, 3),
