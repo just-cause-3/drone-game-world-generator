@@ -17,6 +17,8 @@ import tempfile
 import cv2
 import numpy as np
 
+from .common import publish_directory
+
 
 STAGE1_SCHEMA = "stage1-ground-v1"
 CONTROL_POINTS_SCHEMA = "stage2-control-points-v1"
@@ -36,6 +38,9 @@ class Stage2Options:
     validation_grid_size: int = 9
 
     def validate(self) -> None:
+        for name, value in asdict(self).items():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.min_points < 4:
             raise ValueError("Stage 2 requires at least four control points")
         if self.recommended_points < self.min_points:
@@ -309,8 +314,7 @@ def _publish_directory(temporary: Path, output: Path) -> None:
         if has_contents and not marker.is_file():
             raise ValueError(
                 f"refusing to replace unrelated output directory: {output}")
-        shutil.rmtree(output)
-    temporary.replace(output)
+    publish_directory(temporary, output)
 
 
 def run_stage2(stage1_bundle, control_points_path, output_directory="stage2_out",
