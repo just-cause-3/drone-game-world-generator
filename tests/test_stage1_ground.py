@@ -12,6 +12,7 @@ from scripts.stage1_ground import (
     _class_agnostic_nms,
     _build_background,
     _frame_geometry_audit,
+    _features,
     _inpaint_small_holes,
     _registration,
     _repair_foreground_holes,
@@ -35,6 +36,15 @@ def _synthetic_world(width=320, height=240):
 
 
 class Stage1GroundTests(unittest.TestCase):
+    def test_registration_features_exclude_foreground_actors(self):
+        image = _synthetic_world()
+        mask = np.zeros(image.shape[:2], np.uint8)
+        mask[:, :160] = 255
+        keypoints, descriptors = _features(image, Stage1Options(), mask)
+        self.assertIsNotNone(descriptors)
+        self.assertGreater(len(keypoints), 10)
+        self.assertTrue(all(point.pt[0] >= 160 for point in keypoints))
+
     def test_stage1_uses_class_specific_precision_thresholds(self):
         options = Stage1Options(
             foreground_model="fixture.pt", foreground_full_frame=True,
