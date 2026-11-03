@@ -1,9 +1,41 @@
 """Shared helpers: config, project paths, ffprobe, logging, the frame-index convention."""
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+
+
+def publish_directory(staging: Path, output: Path) -> None:
+    """Publish a validated bundle, restoring its predecessor if promotion fails.
+
+    Callers must verify ownership of an existing destination before calling.
+    Only this invocation's unique backup may be cleaned up.
+    """
+    staging, output = staging.resolve(), output.resolve()
+    if (output == output.parent or staging == output or
+            staging.is_relative_to(output) or output.is_relative_to(staging)):
+        raise ValueError("bundle publication requires separate, non-root directories")
+    backup = output.with_name(f".{output.name}.backup-{uuid.uuid4().hex}")
+    had_output = output.exists()
+    if had_output:
+        os.replace(output, backup)
+    try:
+        os.replace(staging, output)
+    except Exception:
+        if had_output and backup.exists() and not output.exists():
+            os.replace(backup, output)
+        raise
+    if backup.exists():
+        try:
+            shutil.rmtree(backup)
+        except OSError as error:
+            # Publication succeeded. A locked old file must not turn a completed
+            # run into a failure or cause a later run to delete an unrelated path.
+            log("publish", f"New bundle saved; previous bundle retained at {backup}: {error}")
 
 
 def log(stage, msg):
