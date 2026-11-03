@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using DroneWorld.Stage4;
+using DroneWorld.Stage4Geometry.Editor;
 using UnityEditor;
 using UnityEngine;
 
@@ -100,6 +101,10 @@ namespace DroneWorld.Stage4.Editor
             {
                 WriteAcceptance(asset, false, "Operator revoked semantic acceptance.");
             }
+            if (asset.AcceptedForGeometry && GUILayout.Button(
+                    "Open Stage 4B-C 3D Geometry Generator",
+                    GUILayout.Height(30f)))
+                Stage4GeometryPipelineWindow.OpenForAsset(asset);
         }
 
         private static void WriteAcceptance(
