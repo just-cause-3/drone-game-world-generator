@@ -15,7 +15,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .common import log
+from .common import log, publish_directory
 from .stage1_ground import (
     DEFAULT_FOREGROUND_MODEL,
     _normalized_class_name,
@@ -69,6 +69,9 @@ class Stage3Options:
     preview_line_thickness: int = 2
 
     def validate(self) -> None:
+        for name, value in asdict(self).items():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.detector_imgsz < 320:
             raise ValueError("detector_imgsz must be at least 320")
         if not 0.0 < self.detector_low_confidence < 1.0:
@@ -100,6 +103,11 @@ class Stage3Options:
             raise ValueError("gap limits cannot be negative")
         if self.max_interpolation_frames > self.max_lost_frames:
             raise ValueError("interpolation cannot exceed the tracker lost-frame limit")
+        if self.detector_frame_stride > self.max_interpolation_frames + 1:
+            raise ValueError("detector stride skips more frames than interpolation allows")
+        if (self.car_link_diagonal_fraction_per_frame <= 0.0 or
+                self.person_link_diagonal_fraction_per_frame <= 0.0):
+            raise ValueError("association motion limits must be positive")
         if self.minimum_link_distance_px <= 0.0:
             raise ValueError("minimum_link_distance_px must be positive")
         if self.maximum_size_ratio < 1.0:
@@ -160,7 +168,7 @@ def _video_info(path: Path) -> dict:
         }
     finally:
         capture.release()
-    if any(result[key] <= 0 for key in result):
+    if any(not math.isfinite(value) or value <= 0 for value in result.values()):
         raise ValueError("Stage 1 CFR video has invalid metadata")
     return result
 
@@ -185,7 +193,7 @@ def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
         }
     except (KeyError, TypeError, ValueError) as exception:
         raise ValueError("Stage 1 report is missing timeline metadata") from exception
-    if any(declared[key] <= 0 for key in declared):
+    if any(not math.isfinite(value) or value <= 0 for value in declared.values()):
         raise ValueError("Stage 1 timeline metadata is invalid")
 
     video_path = _bundle_path(stage1_root, outputs.get("video_cfr"), "CFR video")
@@ -241,6 +249,9 @@ def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
     if (int(source2.get("pixel_width", -1)) != declared["width"] or
             int(source2.get("pixel_height", -1)) != declared["height"]):
         raise ValueError("Stage 2 calibration dimensions do not match Stage 1")
+    ground_y = float(coordinate_system.get("ground_y_m", 0.0))
+    if not math.isfinite(ground_y):
+        raise ValueError("Stage 2 ground elevation must be finite")
 
     ground = cv2.imread(str(ground_path), cv2.IMREAD_COLOR)
     if ground is None or ground.shape[:2] != (declared["height"], declared["width"]):
@@ -263,7 +274,7 @@ def _load_inputs(stage1_bundle, stage2_bundle) -> dict:
         "scale_confidence": confidence,
         "metric_scale_is_assumed": bool(
             coordinate_system.get("metric_scale_is_assumed", False)),
-        "ground_y": float(coordinate_system.get("ground_y_m", 0.0)),
+        "ground_y": ground_y,
         **declared,
     }
 
@@ -428,6 +439,7 @@ class YoloActorDetector:
             "tile_size": self.options.detector_tile_size,
             "tile_overlap": self.options.detector_tile_overlap,
             "test_time_augmentation": self.options.detector_tta,
+            "retains_low_confidence_for_association": True,
         }
 
     def _predict(self, frame: np.ndarray, x_offset: int, y_offset: int,
@@ -457,11 +469,9 @@ class YoloActorDetector:
             if kind is None:
                 continue
             confidence = float(score)
-            minimum_confidence = (
-                self.options.detector_car_confidence
-                if kind == "car"
-                else self.options.detector_person_confidence)
-            if confidence < minimum_confidence:
+            # Class thresholds govern track creation, not candidate retention.
+            # Weak detections can continue an existing identity but cannot spawn one.
+            if confidence < self.options.detector_low_confidence:
                 continue
             x1, y1, x2, y2 = (float(value) for value in box)
             detections.append({
@@ -513,6 +523,9 @@ class CachedActorDetector:
         if (self.report.get("schema_version") != STAGE3_SCHEMA or
                 self.report.get("stage") != 3):
             raise ValueError("cached detections do not come from a Stage 3 bundle")
+        expected_hash = (self.report.get("artifact_hashes") or {}).get("detections_sha256")
+        if expected_hash and _sha256(detections_path) != expected_hash:
+            raise ValueError("cached detections hash differs from the Stage 3 report")
         metadata = self.report.get("detector")
         if not isinstance(metadata, dict):
             raise ValueError("cached Stage 3 report has no detector metadata")
@@ -534,7 +547,7 @@ class CachedActorDetector:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exception:
                     raise ValueError(
                         f"invalid cached detection on line {line_number}") from exception
-                if frame < previous_frame:
+                if frame < 0 or frame < previous_frame:
                     raise ValueError("cached detections are not frame-monotonic")
                 if kind not in {"car", "person"} or len(box) != 4 or not all(
                         math.isfinite(value) for value in box):
@@ -574,6 +587,13 @@ class CachedActorDetector:
             raise ValueError("cached detections use a different CFR timeline")
         if self.by_frame and max(self.by_frame) >= inputs["frame_count"]:
             raise ValueError("cached detections contain an out-of-range frame")
+
+    def validate_options(self, options: Stage3Options) -> None:
+        stride = (self.report.get("options") or {}).get("detector_frame_stride", 1)
+        if stride != options.detector_frame_stride:
+            raise ValueError(
+                "cached detector cadence differs from requested stride; "
+                "reuse the original stride or run fresh inference")
 
     def detect(self, frame: np.ndarray, frame_index: int) -> list[dict]:
         del frame
@@ -705,16 +725,17 @@ class StabilizedTracker:
     def update(self, frame_index: int, detections: list[dict]) -> None:
         survivors = []
         for track in self.active:
-            if frame_index - track.last_frame > self.options.max_lost_frames:
+            if frame_index - track.last_frame - 1 > self.options.max_lost_frames:
                 self.finished.append(track)
             else:
                 survivors.append(track)
         self.active = survivors
 
         high = [detection for detection in detections
-                if detection["confidence"] >= self.options.detector_high_confidence]
+                if detection["confidence"] >= _track_start_threshold(detection["kind"], self.options)]
         low = [detection for detection in detections
-               if detection["confidence"] < self.options.detector_high_confidence]
+               if self.options.detector_low_confidence <= detection["confidence"] <
+               _track_start_threshold(detection["kind"], self.options)]
         matches, unmatched_track_indices, unmatched_high_indices = self._associate(
             self.active, high, frame_index)
         for track_index, detection_index in matches:
@@ -741,10 +762,18 @@ class StabilizedTracker:
         return sorted(self.finished + self.active, key=lambda track: track.identifier)
 
 
-def _rts_smooth(observations: list[dict], fps: float,
+def _track_start_threshold(kind: str, options: Stage3Options) -> float:
+    class_threshold = (options.detector_car_confidence if kind == "car"
+                       else options.detector_person_confidence)
+    return max(options.detector_high_confidence, class_threshold)
+
+
+def _rts_smooth(observations: list[dict],
                 process_noise: float, measurement_noise: float) -> np.ndarray:
+    # Detector uncertainty is in reference pixels, not metres. Model motion per
+    # frame so an arbitrary Stage 2 scale cannot change the shape of a trajectory.
     measurements = np.asarray(
-        [item["world_anchor"] for item in observations], dtype=np.float64)
+        [item["reference_anchor"] for item in observations], dtype=np.float64)
     frames = np.asarray([item["frame"] for item in observations], dtype=np.int64)
     count = len(observations)
     if count < 3:
@@ -761,7 +790,7 @@ def _rts_smooth(observations: list[dict], fps: float,
     transitions = [np.eye(4)]
     for index in range(count):
         if index > 0:
-            dt = (frames[index] - frames[index - 1]) / fps
+            dt = float(frames[index] - frames[index - 1])
             transition = np.array([
                 [1.0, 0.0, dt, 0.0],
                 [0.0, 1.0, 0.0, dt],
@@ -805,19 +834,30 @@ def _rts_smooth(observations: list[dict], fps: float,
     return smoothed[:, :2]
 
 
-def _playback_track(track: _Track, fps: float, options: Stage3Options) -> dict:
+def _playback_track(track: _Track, fps: float, options: Stage3Options,
+                    pixel_to_world: np.ndarray,
+                    image_size: tuple[int, int] | None = None) -> dict:
     observations = sorted(track.observations, key=lambda item: item["frame"])
-    smooth_positions = _rts_smooth(
-        observations, fps, options.process_noise, options.measurement_noise)
+    # Never smooth through an occlusion the export policy refuses to interpolate.
+    boundaries = [0] + [index for index in range(1, len(observations))
+                       if observations[index]["frame"] - observations[index - 1]["frame"] - 1 >
+                       options.max_interpolation_frames] + [len(observations)]
+    smooth_positions = np.concatenate([
+        _rts_smooth(observations[start:end], options.process_noise, options.measurement_noise)
+        for start, end in zip(boundaries, boundaries[1:])])
+    if image_size is not None:
+        smooth_positions = np.clip(smooth_positions, [0.0, 0.0],
+                                   [image_size[0] - 1.0, image_size[1] - 1.0])
     samples = []
     for index, observation in enumerate(observations):
         start_frame = int(observation["frame"])
         start_position = smooth_positions[index]
+        world_position = _project_point(pixel_to_world, *start_position)
         samples.append({
             "frame": start_frame,
             "t": round(start_frame / fps, 6),
-            "x": float(start_position[0]),
-            "z": float(start_position[1]),
+            "x": world_position[0],
+            "z": world_position[1],
             "observed": True,
             "confidence": float(observation["confidence"]),
         })
@@ -831,39 +871,75 @@ def _playback_track(track: _Track, fps: float, options: Stage3Options) -> dict:
         for frame in range(start_frame + 1, end_frame):
             alpha = (frame - start_frame) / (end_frame - start_frame)
             position = (1.0 - alpha) * start_position + alpha * end_position
+            world_position = _project_point(pixel_to_world, *position)
             samples.append({
                 "frame": frame,
                 "t": round(frame / fps, 6),
-                "x": float(position[0]),
-                "z": float(position[1]),
+                "x": world_position[0],
+                "z": world_position[1],
                 "observed": False,
                 "confidence": 0.0,
             })
     samples.sort(key=lambda item: item["frame"])
+    observation_frames = [item["frame"] for item in observations]
+    measured_pixels = np.asarray([item["reference_anchor"] for item in observations])
+    sample_frames = [sample["frame"] for sample in samples]
+    measured_at_samples = np.column_stack([
+        np.interp(sample_frames, observation_frames, measured_pixels[:, axis])
+        for axis in range(2)])
+    measured_world = np.asarray([
+        _project_point(pixel_to_world, *point) for point in measured_at_samples])
     for index, sample in enumerate(samples):
         previous = samples[max(0, index - 1)]
         following = samples[min(len(samples) - 1, index + 1)]
+        if sample["frame"] - previous["frame"] > 1:
+            previous = sample
+        if following["frame"] - sample["frame"] > 1:
+            following = sample
         dt = (following["frame"] - previous["frame"]) / fps
         dx = following["x"] - previous["x"]
         dz = following["z"] - previous["z"]
         speed = math.hypot(dx, dz) / dt if dt > 0.0 else 0.0
-        if speed > options.stationary_heading_speed_threshold:
+        before_index = index if previous is sample else max(0, index - 1)
+        after_index = index if following is sample else min(len(samples) - 1, index + 1)
+        measured_delta = measured_world[after_index] - measured_world[before_index]
+        measured_speed = float(np.linalg.norm(measured_delta)) / dt if dt > 0.0 else 0.0
+        # A smoother can overshoot and settle after a stop. Do not interpret
+        # that numerical rebound as a vehicle reversing its facing direction.
+        if (speed > options.stationary_heading_speed_threshold and
+                measured_speed > options.stationary_heading_speed_threshold and
+                dx * measured_delta[0] + dz * measured_delta[1] > 0.0):
             heading = math.degrees(math.atan2(dx, dz))
-        elif track.kind == "car":
-            nearest = min(
-                observations,
-                key=lambda observation: abs(observation["frame"] - sample["frame"]))
-            x1, y1, x2, y2 = nearest["reference_bbox_xyxy"]
-            heading = 90.0 if (x2 - x1) >= (y2 - y1) else 0.0
-        elif index > 0:
-            heading = samples[index - 1]["heading_deg"]
         else:
-            heading = 0.0
+            heading = None
         sample["x"] = round(sample["x"], 6)
         sample["z"] = round(sample["z"], 6)
-        sample["heading_deg"] = round(heading, 4)
+        sample["heading_deg"] = round(heading, 4) if heading is not None else None
         sample["speed_units_per_s"] = round(speed, 6)
         sample["confidence"] = round(sample["confidence"], 4)
+    # Hold a moving actor's last direction at a stop. For an initially stopped
+    # actor, use its first measured direction; a never-moving car has only an
+    # ambiguous box-axis prior, which must still pass through Stage 2 calibration.
+    for start, end in zip(boundaries, boundaries[1:]):
+        segment = [sample for sample in samples
+                   if observations[start]["frame"] <= sample["frame"] <= observations[end - 1]["frame"]]
+        heading = next((sample["heading_deg"] for sample in segment
+                        if sample["heading_deg"] is not None), None)
+        if heading is None:
+            heading = 0.0
+            if track.kind == "car":
+                observation = observations[start]
+                x1, y1, x2, y2 = observation["reference_bbox_xyxy"]
+                u, v = observation["reference_anchor"]
+                axis = (1.0, 0.0) if x2 - x1 >= y2 - y1 else (0.0, -1.0)
+                origin = _project_point(pixel_to_world, u, v)
+                tip = _project_point(pixel_to_world, u + axis[0], v + axis[1])
+                heading = round(math.degrees(math.atan2(tip[0] - origin[0], tip[1] - origin[1])), 4)
+        for sample in segment:
+            if sample["heading_deg"] is None:
+                sample["heading_deg"] = heading
+            else:
+                heading = sample["heading_deg"]
     confidences = [float(item["confidence"]) for item in observations]
     return {
         "id": track.identifier,
@@ -933,21 +1009,26 @@ def _draw_track_map(ground: np.ndarray, tracks: list[_Track], destination: Path)
         raise IOError(f"could not write track map: {destination}")
 
 
-def _publish_directory(temporary: Path, output: Path) -> None:
+def _validate_output_target(output: Path) -> None:
     if output.exists():
         if not output.is_dir():
             raise ValueError(f"refusing to replace unrelated output path: {output}")
         marker = output / OUTPUT_MARKER
         if any(output.iterdir()) and not marker.is_file():
             raise ValueError(f"refusing to replace unrelated output directory: {output}")
-        shutil.rmtree(output)
-    temporary.replace(output)
+
+
+def _publish_directory(temporary: Path, output: Path) -> None:
+    _validate_output_target(output)
+    publish_directory(temporary, output)
 
 
 def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                options: Stage3Options | None = None, detector=None) -> dict:
     options = options or Stage3Options()
     options.validate()
+    output = Path(output_directory).resolve()
+    _validate_output_target(output)
     inputs = _load_inputs(stage1_bundle, stage2_bundle)
     detector = detector or YoloActorDetector(options)
     if not hasattr(detector, "detect") or not hasattr(detector, "metadata"):
@@ -955,8 +1036,10 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
     validate_inputs = getattr(detector, "validate_inputs", None)
     if validate_inputs is not None:
         validate_inputs(inputs)
+    validate_options = getattr(detector, "validate_options", None)
+    if validate_options is not None:
+        validate_options(options)
 
-    output = Path(output_directory).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(
         prefix=f".{output.name}-", dir=str(output.parent)))
@@ -1020,6 +1103,8 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                     score = float(raw["confidence"])
                     if not math.isfinite(score) or not 0.0 <= score <= 1.0:
                         raise ValueError("detector emitted an invalid confidence")
+                    if score < options.detector_low_confidence:
+                        continue
                     box = [float(value) for value in raw["bbox_xyxy"]]
                     if len(box) != 4 or not all(math.isfinite(value) for value in box):
                         raise ValueError("detector emitted an invalid bounding box")
@@ -1068,7 +1153,7 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                     mapped.append(item)
                     detection_counts[kind] += 1
                     total_count += 1
-                    if score >= options.detector_high_confidence:
+                    if score >= _track_start_threshold(kind, options):
                         high_count += 1
 
                 tracker.update(processed, mapped)
@@ -1126,7 +1211,9 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
             else:
                 confirmed.append(track)
         playback_tracks = [
-            _playback_track(track, inputs["fps"], options) for track in confirmed
+            _playback_track(track, inputs["fps"], options, inputs["pixel_to_world"],
+                            (inputs["width"], inputs["height"]))
+            for track in confirmed
         ]
         tracks_payload = {
             "schema_version": STAGE3_SCHEMA,
@@ -1161,6 +1248,12 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
             for kind in ("car", "person")
         }
         warnings = []
+        if (detector.metadata.get("reused_detections") and
+                not detector.metadata.get("retains_low_confidence_for_association")):
+            warnings.append(
+                "This detection cache predates low-confidence retention. Retracking "
+                "cannot recover candidates removed by the old detector; run fresh "
+                "inference to use the improved occlusion recovery.")
         if not playback_tracks:
             warnings.append(
                 "No confirmed cars or people were found. This may be correct for an "
@@ -1212,10 +1305,12 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
             },
             "detector": detector.metadata,
             "tracker": {
-                "implementation": "stabilized-reference-plane-association-v1",
+                "implementation": "stabilized-reference-plane-association-v2",
                 "association_space": "stage1_reference_image_pixels",
                 "high_low_confidence_association": True,
                 "offline_smoother": "constant_velocity_RTS",
+                "smoothing_space": "stage1_reference_image_pixels",
+                "smoothing_time_unit": "CFR_frame",
                 "forward_backward_reconciliation": False,
             },
             "quality": {
@@ -1260,6 +1355,14 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                 "tracking_preview": "tracking_preview.mp4",
                 "track_map": "track_map.png",
                 "frame_counts": "frame_counts.csv",
+            },
+            "artifact_hashes": {
+                name + "_sha256": _sha256(temporary / filename)
+                for name, filename in {
+                    "detections": "detections.jsonl", "tracks": "tracks.json",
+                    "tracking_preview": "tracking_preview.mp4", "track_map": "track_map.png",
+                    "frame_counts": "frame_counts.csv",
+                }.items()
             },
         }
         (temporary / "report.json").write_text(

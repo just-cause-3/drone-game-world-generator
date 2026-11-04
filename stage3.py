@@ -19,6 +19,8 @@ def main(argv=None):
     parser.add_argument("--model", default=DEFAULT_FOREGROUND_MODEL)
     parser.add_argument("--imgsz", type=int, default=1280)
     parser.add_argument("--tile-size", type=int, default=640)
+    parser.add_argument("--detector-frame-stride", type=int, default=1,
+                        help="inference cadence; use 2 when reusing fast-mode detections")
     parser.add_argument("--no-tta", action="store_true",
                         help="faster but potentially lower-recall diagnostic run")
     parser.add_argument(
@@ -29,6 +31,7 @@ def main(argv=None):
         detector_model=args.model,
         detector_imgsz=args.imgsz,
         detector_tile_size=args.tile_size,
+        detector_frame_stride=args.detector_frame_stride,
         detector_tta=not args.no_tta,
     )
     try:
