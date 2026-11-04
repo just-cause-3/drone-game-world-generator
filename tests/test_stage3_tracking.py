@@ -114,6 +114,64 @@ class Stage3TrackingTests(unittest.TestCase):
         self.assertTrue(all(s["speed_units_per_s"] == 0.0 for s in payload["samples"]))
         self.assertAlmostEqual(payload["samples"][2]["x"], 20)
 
+    def test_tracker_gap_budget_counts_missing_frames(self):
+        for missing in (0, 3):
+            with self.subTest(missing=missing):
+                options = Stage3Options(max_lost_frames=missing, max_interpolation_frames=missing)
+                tracker = StabilizedTracker(160, 100, 24, options)
+                track = self.make_track([0, missing + 1], [(50, 50), (51, 50)])
+                tracker.update(0, [track.observations[0]])
+                for frame in range(1, missing + 1):
+                    tracker.update(frame, [])
+                tracker.update(missing + 1, [track.observations[1]])
+                self.assertEqual(1, len(tracker.all_tracks()))
+
+    def test_weak_person_continues_existing_track_but_cannot_start_one(self):
+        tracker = StabilizedTracker(160, 100, 24, Stage3Options())
+        track = self.make_track([0, 1, 2], [(50, 50), (51, 50), (52, 50)],
+                                "person", [0.9, 0.15, 0.9])
+        weak_new = self.make_track([1], [(100, 50)], "person", [0.4]).observations[0]
+        tracker.update(0, [track.observations[0]])
+        tracker.update(1, [track.observations[1], weak_new])
+        tracker.update(2, [track.observations[2]])
+        self.assertEqual(1, len(tracker.all_tracks()))
+        self.assertEqual(3, len(tracker.all_tracks()[0].observations))
+        self.assertNotIn("track_id", weak_new)
+
+    def test_actual_yolo_adapter_retains_weak_people_for_association(self):
+        # Exercise the production adapter without downloading/loading a model.
+        class Tensor:
+            def __init__(self, values): self.values = np.asarray(values)
+            def cpu(self): return self
+            def numpy(self): return self.values
+
+        class Boxes:
+            xyxy = Tensor([[10, 10, 20, 20]])
+            cls = Tensor([0])
+            conf = Tensor([0.15])
+
+        class Result:
+            boxes = Boxes()
+
+        class Model:
+            def predict(self, *args, **kwargs): return [Result()]
+
+        detector = YoloActorDetector.__new__(YoloActorDetector)
+        detector.options = Stage3Options()
+        detector.model = Model()
+        detector.class_kinds = {0: "person"}
+        detector.model_names = {0: "pedestrian"}
+        detector.device = "cpu"
+        candidates = detector._predict(np.zeros((48, 64, 3), np.uint8), 0, 0, "full")
+        self.assertEqual(1, len(candidates))
+        self.assertAlmostEqual(0.15, candidates[0]["confidence"])
+
+    def test_rejects_nonfinite_options_and_unbridgeable_stride(self):
+        for options in (Stage3Options(measurement_noise=float("nan")),
+                        Stage3Options(detector_frame_stride=5)):
+            with self.assertRaises(ValueError):
+                options.validate()
+
 
 if __name__ == "__main__":
     unittest.main()
