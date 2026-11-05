@@ -167,6 +167,18 @@ namespace DroneWorld.Stage3
             int right = Mathf.Clamp(upper, 0, samples.Length - 1);
             Stage3TrackSample first = samples[left];
             Stage3TrackSample second = samples[right];
+            // Python explicitly omits gaps beyond its interpolation budget.
+            // Preserve the first sample for its own video frame, then hide the
+            // actor until the next supported sample instead of inventing motion.
+            if (second.Frame - first.Frame > 1)
+            {
+                if (evaluationTime >= first.TimeSeconds + frameDuration)
+                {
+                    actor.Transform.gameObject.SetActive(false);
+                    return;
+                }
+                second = first;
+            }
             float interval = second.TimeSeconds - first.TimeSeconds;
             float alpha = interval > 1e-6f
                 ? Mathf.Clamp01((evaluationTime - first.TimeSeconds) / interval)

@@ -63,6 +63,19 @@ namespace DroneWorld.Stage3.Editor
             ValidateReport(report);
             string tracksPath = ResolveArtifact(
                 bundleRoot, report.outputs.tracks, "tracks");
+            if (report.artifact_hashes != null && !string.Equals(
+                    Sha256(tracksPath), report.artifact_hashes.tracks_sha256,
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Stage 3 tracks changed after processing.");
+            string mapPath = null;
+            if (!string.IsNullOrWhiteSpace(report.outputs.track_map))
+            {
+                mapPath = ResolveArtifact(bundleRoot, report.outputs.track_map, "track_map");
+                if (report.artifact_hashes != null && !string.Equals(
+                        Sha256(mapPath), report.artifact_hashes.track_map_sha256,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Stage 3 track map changed after processing.");
+            }
             Stage3TracksData tracks = JsonUtility.FromJson<Stage3TracksData>(
                 File.ReadAllText(tracksPath));
             ValidateProvenance(report, manifest, calibration);
@@ -74,10 +87,8 @@ namespace DroneWorld.Stage3.Editor
             string importedReportPath = $"{assetFolder}/stage3_report.json";
             CopyExternalFile(tracksPath, importedTracksPath);
             CopyExternalFile(reportPath, importedReportPath);
-            if (!string.IsNullOrWhiteSpace(report.outputs.track_map))
+            if (mapPath != null)
             {
-                string mapPath = ResolveArtifact(
-                    bundleRoot, report.outputs.track_map, "track_map");
                 CopyExternalFile(mapPath, $"{assetFolder}/stage3_track_map.png");
             }
             AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);

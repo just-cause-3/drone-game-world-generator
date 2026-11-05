@@ -27,6 +27,14 @@ namespace DroneWorld.Stage3.Editor
         public Stage3SourceStage2Data source_stage2;
         public Stage3TimelineData timeline;
         public Stage3OutputData outputs;
+        public Stage3ArtifactHashes artifact_hashes;
+    }
+
+    [Serializable]
+    internal sealed class Stage3ArtifactHashes
+    {
+        public string tracks_sha256;
+        public string track_map_sha256;
     }
 
     [Serializable]
