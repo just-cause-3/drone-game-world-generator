@@ -14,7 +14,7 @@ from typing import Protocol
 import cv2
 import numpy as np
 
-from .common import log
+from .common import log, publish_directory
 from .stage1_ground import _tile_origins
 from .track_agents import resolve_device
 from setup_stage4_model import (
@@ -95,6 +95,9 @@ class Stage4Options:
     overlay_alpha: float = 0.48
 
     def validate(self) -> None:
+        for name, value in asdict(self).items():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.semantic_backend not in (
                 "hybrid-openearthmap-road", "openearthmap-mask2former",
                 "legacy-cityscapes-yolo"):
@@ -295,7 +298,9 @@ class ExternalLabelProvider:
             raise ValueError(
                 f"external labels are {labels.shape[1]}x{labels.shape[0]}; expected "
                 f"{image.shape[1]}x{image.shape[0]}")
-        return labels.astype(np.uint8, copy=False)
+        # Validate the original integer values before converting; a uint16 ID
+        # such as 257 must not wrap into canonical road (1).
+        return _validate_labels(labels, image.shape[0], image.shape[1])
 
 
 class OpenEarthMapMask2FormerProvider:
@@ -690,19 +695,8 @@ def _validate_output_target(output: Path) -> None:
 
 
 def _publish_directory(temporary: Path, output: Path) -> None:
-    backup = output.with_name(f".{output.name}-previous")
-    if backup.exists():
-        shutil.rmtree(backup)
-    if output.exists():
-        output.replace(backup)
-    try:
-        temporary.replace(output)
-    except Exception:
-        if backup.exists() and not output.exists():
-            backup.replace(output)
-        raise
-    if backup.exists():
-        shutil.rmtree(backup)
+    _validate_output_target(output)
+    publish_directory(temporary, output)
 
 
 def run_stage4_semantics(stage1_bundle, stage2_bundle,

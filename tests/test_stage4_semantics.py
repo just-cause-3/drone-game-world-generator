@@ -122,6 +122,13 @@ class Stage4SemanticTests(unittest.TestCase):
             [CANONICAL_IDS["road"], CANONICAL_IDS["terrain"]],
         ], dtype=np.uint8))
 
+    def test_external_16bit_labels_cannot_wrap_into_valid_classes(self):
+        stage1, stage2 = self.make_bundles()
+        path = self.root / "invalid_16bit_labels.png"
+        cv2.imwrite(str(path), np.full((100, 160), 257, np.uint16))
+        with self.assertRaisesRegex(ValueError, "IDs outside"):
+            run_stage4_semantics(stage1, stage2, self.root / "stage4", external_labels=path)
+
     def test_emits_review_bundle_with_upstream_and_artifact_hashes(self):
         stage1, stage2 = self.make_bundles()
         output = self.root / "stage4"
