@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import gc
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import traceback
@@ -83,8 +84,8 @@ def _write_approximate_control_points(
         path: Path, width: int, height: int, world_width: float) -> None:
     if width < 2 or height < 2:
         raise ValueError("Stage 1 declared invalid image dimensions")
-    if world_width <= 0.0:
-        raise ValueError("assumed world width must be positive")
+    if not math.isfinite(world_width) or world_width <= 0.0:
+        raise ValueError("assumed world width must be finite and positive")
     half_width = world_width * 0.5
     half_depth = world_width * height / width * 0.5
     max_u = width - 1
@@ -145,6 +146,8 @@ def run_full_pipeline(
         raise FileNotFoundError(f"input video does not exist: {source}")
     if not pipeline_mode.strip():
         raise ValueError("pipeline_mode cannot be empty")
+    if not math.isfinite(assumed_world_width_m) or assumed_world_width_m <= 0.0:
+        raise ValueError("assumed world width must be finite and positive")
     _prepare_run_root(root, source, pipeline_mode)
 
     report_path = root / "pipeline_report.json"
@@ -163,8 +166,10 @@ def run_full_pipeline(
     }
 
     def publish() -> None:
-        report_path.write_text(
-            json.dumps(pipeline_report, indent=2) + "\n", encoding="utf-8")
+        temporary_report = report_path.with_suffix(".json.tmp")
+        temporary_report.write_text(
+            json.dumps(pipeline_report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        temporary_report.replace(report_path)
 
     publish()
     paths = {stage: root / f"stage{stage}" for stage in range(1, 5)}
