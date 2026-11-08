@@ -212,3 +212,67 @@ overlay. See [the detailed label-correction instructions](docs/HOW_TO_RUN.md#8-r
 The value `8` is your chosen building-height assumption. If the accepted map contains
 no buildings, generating zero buildings is correct; an intersection-only video may
 still look mostly flat.
+
+## 8. Play the finished scene
+
+1. If necessary, double-click **Assets -> Scenes -> Stage4GeneratedWorld** in Unity's
+   **Project** panel to open the scene.
+2. Click Unity's main **Play** button at the top.
+3. Open the **Game** tab to see the camera view.
+4. Select **Stage 3 Real Track Playback** in the **Hierarchy**.
+5. Use its Inspector's **Pause / Play**, **Reset**, and **Timeline (seconds)** controls.
+
+You should see confirmed cars and people replaying their paths on the generated
+world. Actors appear only during their supported time intervals. Stationary actors
+may be hidden by the playback settings.
+
+To view actor playback without the geometry, open
+**Assets -> Scenes -> Stage3ActorPlayback** and press Play instead.
+
+Exit Play Mode before rebuilding or importing anything. Changes made only during
+Play Mode are generally not saved as scene edits.
+
+## Run another video later
+
+Repeat **Steps 5-8**. Select the new video and use a new run folder.
+You do not need to reinstall Python, download models again, or make a new Unity project.
+
+Separate run folders preserve the external results. Unity reuses the standard
+generated scene names, so reimport the matching run when switching between videos.
+
+## Reopen completed results without processing again
+
+If the scenes are already imported, simply open `Stage4GeneratedWorld.unity` and press Play.
+
+If you need to import a completed run again:
+
+1. Exit Play Mode.
+2. Open **Drone World -> Run Full Pipeline - Fast Mode (Stages 1-4A)...**.
+3. Set the run-folder field to the existing completed run's **parent folder**,
+   such as `runs\perfect_top_down_v2_full`, not its `stage1` or `stage4` subfolder.
+4. Click **Import Existing Passing Fast Run**. Despite its name, the current import
+   action accepts a passing normal or fast run. It imports files without inference.
+5. Continue from Step 6. Existing acceptance remains usable only if the exact map
+   and report still match. In the geometry window, **Import Existing Passing Geometry
+   Bundle** lets you reuse a matching completed `stage4\geometry` bundle.
+
+Do not click a **Run** button just to reopen results: it can repeat processing.
+
+## Troubleshooting
+
+| Problem | Simple next step |
+| --- | --- |
+| No **Drone World** menu | Wait for compilation, then check Unity's Console for red compile errors. Confirm you opened `UnityProject\DroneWorldRecreation`. |
+| Missing model or Python environment | Complete Steps 2-3 in the repository folder. |
+| CUDA is false / the run is very slow | Run `nvidia-smi` in PowerShell. If it cannot see the GPU, check the NVIDIA driver. If it can, check the project's PyTorch CUDA installation using the official selector linked in Step 2. A CUDA-enabled package still needs a working compatible driver. |
+| A run folder is missing | Type the full new path into the run-folder text field. The pipeline creates it. |
+| The log has not changed for a while | One detector pass can be slow, especially on CPU. Check Task Manager for the Python process and its CPU/GPU activity before starting another run. |
+| Stage 1 failed | Read `failure_reasons` in the run's `stage1\report.json`. Check footage suitability; do not bypass the quality gate. |
+| Fast mode passed Stages 1-3 but failed Stage 4 | Retry with the same video, run folder, and width. It resumes Stage 4 only if its saved inputs and artifacts still validate. |
+| Import says files are stale or mismatched | Use stages from the same run. If an upstream stage changed, rebuild the stages depending on it. |
+| Only one sample car/person, or no movement | Open `Stage3ActorPlayback` or `Stage4GeneratedWorld`, then press Play. Sample-model placement is not real tracking playback. Check `stage3\report.json` for confirmed tracks. |
+| No 3D buildings | Finish Steps 6-7 and check whether the accepted map actually has building regions. |
+| Unity reports no valid license | Open Unity Hub, sign in, and activate an eligible Editor license, then reopen the project. |
+
+For individual-stage commands and advanced options, see [the detailed guide](docs/HOW_TO_RUN.md).
+For recent fixes and remaining accuracy limits, see [the robustness audit](docs/ROBUSTNESS_AUDIT.md).
