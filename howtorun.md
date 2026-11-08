@@ -121,3 +121,94 @@ Do not select the repository root or create another blank project. Keep the Unit
 project in its current repository location so it can find Python and the models.
 
 An empty scene or a **STAGE 1 WAITING** platform is normal before processing.
+
+## 5. Run the video through Stages 1-4A
+
+Use a short test video first. It should look almost straight down, remain mostly
+stationary, and contain one continuous shot. Small drift and smooth bounded zoom
+are supported. Avoid cuts, sudden zoom jumps, and strongly angled footage.
+
+1. In Unity, exit **Play Mode** if it is running.
+2. Open **Drone World -> Run Full Pipeline (Stages 1-4A)...**.
+3. Click **Browse** beside **Input video** and select your video. For example:
+
+   ```text
+   D:\drone-game-world-generator-usin-cv\sample_vids\A_perfectly_top_down_degre.mp4
+   ```
+
+4. In **Isolated run folder**, type a new folder path:
+
+   ```text
+   D:\drone-game-world-generator-usin-cv\runs\perfect_top_down_v2_full
+   ```
+
+   **The folder does not have to exist. The pipeline creates it.** Use the text field
+   when entering a new path; the folder picker is for existing folders.
+5. Set **Approx. image width (m)** to `40` for a first test without measurements.
+   This makes the whole ground image approximately 40 Unity units wide; it is not
+   the width of one road or a detected measurement.
+6. Click **Run Stages 1-4A** once.
+7. Keep Unity open and wait for the final status. Do not start another pipeline or
+   enter Play Mode while it is processing.
+
+The pipeline automatically creates the ground, assigns coordinates, tracks cars and
+people, and proposes the static labels. No manual ground markers are needed in this mode.
+
+**Success:** the status begins with `PASS`, and `Stage4SemanticReview.unity` opens.
+The colored overlay is a review map, not the finished 3D world.
+
+**Failure:** read the failed stage and reason in the pipeline window. The automated
+run stops; do not continue to geometry as if it passed.
+
+### Want a faster run?
+
+Use **Drone World -> Run Full Pipeline - Fast Mode (Stages 1-4A)...** instead.
+Choose a separate folder, such as `runs\perfect_top_down_v2_fast`, and click
+**Run Stages 1-4A - Fast**.
+
+Fast mode detects actors on alternate frames and keeps full-rate playback. It can
+miss very brief appearances. The normal mode detects every frame. Do not use the
+same run folder for both modes.
+
+## 6. Review and accept Stage 4A
+
+First open your run folder in File Explorer and check:
+
+| File inside the run folder | What to check |
+| --- | --- |
+| `stage1\ground.png` | Ground looks aligned; cars and people are not left painted into it. |
+| `stage3\tracking_preview.mp4` | Detection boxes and candidate IDs follow the visible actors. |
+| `stage4\semantic_overlay.png` | Roads, sidewalks, buildings, and vegetation are labelled sensibly. |
+
+Then return to Unity:
+
+1. In the **Hierarchy** panel, select **Drone World - Stage 4A Semantic Review (NO GEOMETRY)**.
+2. Look at its **Inspector**. Use **Hide Semantic Overlay / Show Semantic Overlay**
+   to compare the labels with the ground image.
+3. If the labels are correct, click **Accept Exact Semantic Map for Stage 4B**.
+4. Click **Accept** in the confirmation dialog.
+
+Select the **object in the Hierarchy**, not the scene file in the Project panel.
+Selecting a scene file only shows its scene-asset Inspector and an Open button.
+
+If labels are wrong, correct them before accepting. Open
+**Drone World -> Stage 4 -> Run Stage 4A Semantic Mapping...**, choose a corrected
+label PNG in **Corrected labels (optional)**, and rerun only Stage 4A using the
+matching calibration and the same run's `stage4` folder. Then review again.
+The correction must be a single-channel image containing class IDs, not the colored
+overlay. See [the detailed label-correction instructions](docs/HOW_TO_RUN.md#8-run-stage-4a-create-and-review-static-semantic-labels).
+
+## 7. Generate the 3D world — Stage 4B-C
+
+1. On the accepted review object's Inspector, click
+   **Open Stage 4B-C 3D Geometry Generator**.
+2. Confirm **Accepted Stage 4A map** is filled in.
+3. Leave **Geometry output** at the selected run's `stage4\geometry` folder.
+4. For a first run, use **Height policy: Fixed**, **Fixed building height (m): 8**,
+   and leave the other settings unchanged. Leave **Vegetation placeholders** off.
+5. Click **Generate and Import Provisional 3D World**.
+6. Wait for `PASS` and `Stage4GeneratedWorld.unity` to open.
+
+The value `8` is your chosen building-height assumption. If the accepted map contains
+no buildings, generating zero buildings is correct; an intersection-only video may
+still look mostly flat.
