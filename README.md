@@ -1,14 +1,16 @@
 # Drone Video → Unity Recreation Pipeline
 
-> **New user? Start here:** follow
+> **Simple end-to-end instructions:** start with [`howtorun.md`](howtorun.md).
+>
+> **Detailed setup and reference:** follow
 > [`docs/HOW_TO_RUN.md`](docs/HOW_TO_RUN.md) for the complete one-time setup and the
-> current Stage 1 → Stage 2 → Stage 3 → Stage 4A Unity workflow. The long legacy guide later in
+> current Stage 1 → Stage 2 → Stage 3 → Stage 4A-C Unity workflow. The long legacy guide later in
 > this README is reference material for the reverted implementation.
 
 > **Staged rebuild status:** Stage 1 static-ground reconstruction, Stage 2 coordinate
-> calibration, Stage 3 car/person playback, and review-gated Stage 4A semantic mapping
-> are implemented in the clean Unity project. Polygonization, height estimation, and
-> 3D geometry are the later Stage 4 substages. The older end-to-end pipeline
+> calibration, Stage 3 car/person playback, review-gated Stage 4A semantic mapping,
+> and accepted-map Stage 4B-C provisional geometry are implemented in the clean Unity
+> project. Appearance replacement and final spatial QA are later substages. The older end-to-end pipeline
 > below is retained only as reference.
 
 ## One-click Stage 1 → 4A run
@@ -23,7 +25,8 @@ same Unity project.
 
 This is deliberately fail-closed: a rejected stage stops all downstream work and no
 new bundles are imported into Unity. A complete run still ends at the mandatory
-Stage 4A semantic review; it does not accept labels or create 3D geometry automatically.
+Stage 4A semantic review. After a human accepts the exact map, the separate Stage 4B-C
+window can create geometry; acceptance is never automated.
 
 The equivalent processing-only command is:
 
@@ -32,6 +35,9 @@ The equivalent processing-only command is:
 ```
 
 ### Separate balanced fast mode
+
+For the latest accuracy fixes, verification results, cache compatibility, and remaining
+limitations, see [the workflow robustness audit](docs/ROBUSTNESS_AUDIT.md).
 
 Select **Drone World -> Run Full Pipeline - Fast Mode (Stages 1-4A)...** to run the
 separate fast entry point. It keeps the 1280 px detector input, full-frame pass,
@@ -174,6 +180,25 @@ hash-bound map before Stage 4B can consume it. See
 [`docs/STAGE4_IMPLEMENTATION_PLAN.md`](docs/STAGE4_IMPLEMENTATION_PLAN.md) and
 [`docs/STAGE4_CONTRACT.md`](docs/STAGE4_CONTRACT.md).
 
+## New Stage 4B-C — accepted semantics to provisional 3D geometry
+
+After correcting and accepting the exact Stage 4A map, select **Drone World -> Stage 4
+-> Generate Accepted 3D World (Stage 4B-C)...**. The generator revalidates the
+acceptance/report/label hashes, vectorizes building regions through the Stage 2
+homography, triangulates their roofs, and creates editable Unity wall/roof meshes and
+colliders. It preserves the Stage 3 playback and adds a perspective preview camera.
+
+The equivalent processing-only command is:
+
+```powershell
+.venv\Scripts\python.exe stage4b.py stage4_out --output stage4_geometry_out --building-height 8
+```
+
+The fixed height is an explicit operator assumption. `footprint_prior` can provide
+visual variation, but it is not metric evidence. Vegetation proxies are opt-in because
+semantic vegetation may represent grass rather than tree canopy. See
+[`docs/STAGE4_GEOMETRY_CONTRACT.md`](docs/STAGE4_GEOMETRY_CONTRACT.md).
+
 ## Staged roadmap
 
 1. **Stage 1 — static ground:** validate the fixed top-down video, normalize camera
@@ -184,9 +209,10 @@ hash-bound map before Stage 4B can consume it. See
    persistent identities, transform every trajectory through the Stage 1 frame geometry
    and Stage 2 calibration, estimate direction/speed, and emit metric Unity playback.
    Trucks and other classes remain excluded under the current project policy.
-4. **Stage 4 — static scene understanding and 3D geometry:** Stage 4A now creates a
-   review-gated semantic proposal. Stage 4B polygonization, Stage 4C height hypotheses,
-   and Stage 4D Unity geometry remain deliberately blocked until semantic acceptance.
+4. **Stage 4 — static scene understanding and 3D geometry:** Stage 4A creates a
+   review-gated semantic proposal. Stage 4B-C now vectorizes an accepted map and builds
+   provisional Unity geometry with explicit assumed-height metadata. Stage 4D asset
+   replacement and Stage 4E final spatial QA remain future work.
 5. **Stage 5 — integration and validation:** combine the metric static world and dynamic
    tracks, then verify timing, placement, scale, collisions, and playback behavior.
 

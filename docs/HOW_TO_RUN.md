@@ -1,7 +1,10 @@
 # Beginner guide: install and run the drone-video-to-Unity pipeline
 
+For a simpler numbered walkthrough, start with [howtorun.md](../howtorun.md).
+This document keeps the detailed per-stage instructions and reference options.
+
 This is the authoritative setup and run guide for the current staged project. It
-covers the existing Stage 1, Stage 2, Stage 3, and Stage 4A implementation. The legacy workflow
+covers the existing Stage 1, Stage 2, Stage 3, and Stage 4A-C implementation. The legacy workflow
 later in the repository's main README is retained only as design reference and should
 not be used with the current Unity project.
 
@@ -19,11 +22,15 @@ pipeline produces:
 4. **Stage 4A — semantic review:** a provisional pixel map of roads, pavement,
    buildings, vegetation, terrain, water, and other static content, displayed in a
    Unity review scene and blocked from geometry until explicit operator acceptance.
+5. **Stage 4B-C — provisional 3D world:** accepted building regions are vectorized
+   and extruded, flat semantic regions remain registered to the Stage 2 ground, and
+   optional vegetation placeholders can be generated. Every height is visibly marked
+   as assumed.
 
-Stage 4B–4D polygonization, building-height inference, and 3D generation are not yet
-implemented. Fixed top-down monocular footage does not contain enough parallax to
-measure building height, so later height values must remain visibly marked as assumed
-unless another source is supplied.
+Stage 4D appearance/prop replacement and Stage 4E final spatial QA remain future work.
+Fixed top-down monocular footage does not contain enough parallax to measure building
+height, so current height values remain visibly marked as assumed unless another
+evidence source is supplied.
 
 ## Quick run checklist
 
@@ -37,8 +44,11 @@ If the machine is already configured, the normal run is:
 4. Click **Run Stages 1-4A**. The command stops at the first failed quality gate and
    imports nothing into Unity unless all four processing stages pass.
 5. Inspect all review artifacts. Accept Stage 4A only after labels are corrected.
-6. Use `Stage3ActorPlayback.unity` for playback and `Stage4SemanticReview.unity` for
-   the static semantic review.
+6. From the accepted review root, open the Stage 4B-C generator and create the
+   provisional 3D world.
+7. Use `Stage3ActorPlayback.unity` for isolated playback,
+   `Stage4SemanticReview.unity` for label review, and `Stage4GeneratedWorld.unity`
+   for the composed 3D preview with actor playback.
 
 Each video gets separate artifacts at `runs/<video-name>/stage1` through `stage4`, so
 trying another clip does not overwrite the earlier `stage1_out`-style folders. A run
@@ -490,6 +500,45 @@ the exact SHA-256 of `report.json` and `semantic_labels.png`. Re-running or chan
 either file invalidates the acceptance. Acceptance does not certify heights and does
 not create geometry.
 
+### 8.1 Generate the accepted provisional 3D world
+
+Do not perform these steps if the automatic colors are visibly wrong. Correct the
+canonical PNG and rerun Stage 4A first.
+
+1. Select the accepted **Stage 4A Semantic Review** root in the Hierarchy.
+2. In its Inspector, click **Open Stage 4B-C 3D Geometry Generator**. The same window
+   is available from **Drone World → Stage 4 → Generate Accepted 3D World
+   (Stage 4B-C)...**.
+3. Keep the default geometry output inside the run, normally
+   `runs/<name>/stage4/geometry`.
+4. Choose a height policy:
+   - **Fixed** uses the displayed operator-configured height for every building and is
+     the safest default when no height evidence exists.
+   - **Footprint Prior** varies assumed floor count from roof area. It can look more
+     natural but is not more physically accurate.
+5. Leave vegetation placeholders disabled unless the accepted vegetation mask really
+   represents tree canopy rather than grass or general green space.
+6. Click **Generate and Import Provisional 3D World**.
+7. On success Unity opens:
+
+   ```text
+   Assets/Scenes/Stage4GeneratedWorld.unity
+   ```
+
+8. Inspect the scene from the perspective Game camera and in Scene view. Select the
+   generated-world root to toggle buildings, vegetation, and the accepted semantic
+   overlay. Press Play to run the matching Stage 3 actor playback over the world.
+
+The generator refuses missing, revoked, or stale acceptance; invalid polygons;
+escaping or corrupted artifacts; mismatched Stage 2 coordinates; and unsafe output
+replacement. Building meshes include roof/wall geometry and mesh colliders. The Stage
+2 ground remains the authoritative ground collider.
+
+Current limits are intentional: roof outlines are used as provisional wall
+footprints, courtyard holes are filled and warned about, facades are procedural, and
+all heights and optional vegetation dimensions are assumptions. See
+`STAGE4_GEOMETRY_CONTRACT.md`.
+
 Review these external artifacts:
 
 ```text
@@ -518,6 +567,8 @@ Stage 2 → stage2_out + Stage2MetricWorld.unity
 Stage 3 → stage3_out + Stage3ActorPlayback.unity
    ↓
 Stage 4A → stage4_out + Stage4SemanticReview.unity
+   ↓ operator reviews/corrects and accepts exact label hashes
+Stage 4B-C → stage4_out/geometry + Stage4GeneratedWorld.unity
 ```
 
 Changing the source video or regenerating Stage 1 invalidates the old Stage 2 and Stage
@@ -573,6 +624,13 @@ inference:
 
 ```powershell
 .\.venv\Scripts\python.exe stage4.py stage1_out stage2_out --output stage4_out --semantic-labels path\to\corrected_labels.png
+```
+
+After Unity has written a valid acceptance record, generate the Stage 4B-C geometry
+bundle without importing it:
+
+```powershell
+.\.venv\Scripts\python.exe stage4b.py stage4_out --output stage4_geometry_out --building-height 8
 ```
 
 Python exit codes are:
@@ -699,12 +757,17 @@ Before treating a run as successful, verify all of the following:
 - `track_map.png` has plausible, continuous paths without identity teleports.
 - `Stage3ActorPlayback.unity` enters Play Mode without Console errors.
 - Cars and people move on the ground at the correct video timing.
-- `stage4_out/report.json` has `"pass": true` and `"ready_for_geometry": false`.
+- `stage4_out/report.json` has `"pass": true` and `"ready_for_geometry": false`
+  until separate operator acceptance.
 - `semantic_overlay.png` was checked against the original ground at full resolution.
 - Incorrect automatic labels were corrected and Stage 4A was rerun.
 - `semantic_acceptance.json` exists only if the exact current map was consciously
-  accepted for later polygonization.
-- No Stage 4 result is described as measured height or completed 3D geometry.
+  accepted for polygonization.
+- `stage4_out/geometry/report.json` is passing and its source hashes match the accepted
+  Stage 4A bundle.
+- `Stage4GeneratedWorld.unity` contains plausible building footprints and matching
+  Stage 3 playback, without actors passing through accepted buildings.
+- Every current Stage 4 height is described as assumed, never measured.
 
 ## 13. Licensing before distribution
 
@@ -723,4 +786,5 @@ For implementation details and quality contracts, see:
 - [`STAGE3_CONTRACT.md`](STAGE3_CONTRACT.md)
 - [`STAGE3_IMPLEMENTATION_PLAN.md`](STAGE3_IMPLEMENTATION_PLAN.md)
 - [`STAGE4_CONTRACT.md`](STAGE4_CONTRACT.md)
+- [`STAGE4_GEOMETRY_CONTRACT.md`](STAGE4_GEOMETRY_CONTRACT.md)
 - [`STAGE4_IMPLEMENTATION_PLAN.md`](STAGE4_IMPLEMENTATION_PLAN.md)

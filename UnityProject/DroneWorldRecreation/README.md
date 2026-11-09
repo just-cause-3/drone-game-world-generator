@@ -115,7 +115,14 @@ semantics plus a road-only specialist; the specialist cannot propose buildings.
 `pass` remains only a file/provenance/coverage gate. Acceptance is stored externally
 and bound to the exact report and semantic-label hashes.
 Changing either artifact invalidates approval. Stage 4B polygonization, height
-hypotheses, and final Unity geometry remain future substages.
+hypotheses, and provisional Unity geometry are now available only after that gate.
+
+After acceptance, click **Open Stage 4B-C 3D Geometry Generator** on the review root,
+or use **Drone World -> Stage 4 -> Generate Accepted 3D World (Stage 4B-C)...**.
+The generated scene is `Assets/Scenes/Stage4GeneratedWorld.unity`. It contains
+extruded building meshes/colliders, optional conservative vegetation placeholders,
+an angled preview camera, and the matching Stage 3 playback. All heights are explicit
+assumptions because stationary top-down footage has no physical depth baseline.
 
 The editor integration has a batch-mode self-test (`DroneWorld.Stage1.Editor.Stage1UnitySelfTest.Run`)
 that imports a temporary passing fixture, verifies the mesh/UV convention, then removes

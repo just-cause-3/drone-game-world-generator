@@ -141,7 +141,7 @@ metric truth from this fixed top-down shot: <https://github.com/DepthAnything/De
 
 ## Staged implementation
 
-### Stage 4A - semantic proposal and review (current milestone)
+### Stage 4A - semantic proposal and review (implemented)
 
 Inputs: passing Stage 1 + Stage 2, plus either an automatic backend or corrected label
 PNG.
@@ -158,14 +158,14 @@ Outputs:
 Passing Stage 4A means the artifact is structurally valid, not that the labels are
 correct. The operator must inspect the overlay and create a hash-bound acceptance record.
 
-### Stage 4B - accepted raster to validated polygons
+### Stage 4B - accepted raster to validated polygons (implemented)
 
 - Require `stage4-semantic-acceptance-v1` matching the exact Stage 4A report and labels.
 - Extract, simplify, regularize, map, and validate polygons.
 - Emit pixel and Unity X/Z coordinates plus comparison overlays.
 - Do not generate meshes on failed topology or stale acceptance.
 
-### Stage 4C - height policy and building generation
+### Stage 4C - height policy and building generation (implemented provisionally)
 
 - Require an explicit height policy.
 - Create extruded building/curb/static-region meshes.
@@ -219,8 +219,9 @@ acceptance record even if the Stage 4A structural gate passed.
 - Real sample smoke test producing review artifacts from `stage1_out`.
 - Unity compilation/import tests for stale hashes, texture dimensions, acceptance, and
   scene preservation after rejection.
-- Later Stage 4B/4C tests for polygon topology, homography mapping, triangulation,
-  extrusion winding, bounds, and colliders.
+- Stage 4B/4C tests cover acceptance hashes, homography mapping, polygon
+  triangulation, bounded vegetation proxies, and safe publication. Unity compilation
+  covers geometry import, extrusion winding, bounds, and collider construction.
 
 ## Completion criteria
 

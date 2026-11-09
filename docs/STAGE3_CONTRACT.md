@@ -38,6 +38,12 @@ Only these labels are consumed:
 Vans, trucks, buses, bicycles, motorcycles, tricycles, and every other class are
 ignored. Class names are resolved from model metadata; numeric IDs are never assumed.
 
+Candidates down to the low confidence threshold (0.08 by default) are retained for
+association. A new track requires the larger of the global high threshold (0.25)
+and the class threshold (car 0.20, person 0.60). Weaker candidates can continue an
+existing identity after its motion, size, and appearance checks; they cannot create
+a new one. This distinction applies to the actual YOLO adapter, not just the tracker.
+
 ## Coordinate and association rule
 
 For a detection centre `[u, v, 1]` in CFR frame `n`:
@@ -65,12 +71,20 @@ The tracker uses high/low confidence association: high-confidence observations
 can create and confirm identities, while low-confidence observations can only recover
 an existing identity. Matching is class-specific and gated by stabilized predicted
 position, transformed-box overlap, size consistency, and a central-crop HSV appearance
-histogram. Recovery is limited to three frames so an expired identity cannot jump to a
+histogram. Recovery is limited to three missing frames so an expired identity cannot jump to a
 different actor. Short gaps are interpolated and explicitly marked `observed: false`.
-A constant-velocity Rauch-Tung-Striebel pass smooths confirmed observations before
-playback samples are written. A segment needs at least five observed frames before it
+A constant-velocity Rauch-Tung-Striebel pass smooths reference-image positions using
+pixels and CFR frames as its units, then projects them through Stage 2. Changing the
+assumed world width therefore scales the path rather than changing its shape. Noise
+parameters apply in reference-pixel space. Smoothing runs separately on either side
+of gaps larger than the interpolation limit, and smoothed positions stay within the
+reference-image rectangle. A track needs at least five observed frames before it
 is allowed into playback, preventing very short detector flicker from spawning an
 actor.
+
+Moving actors retain their last supported heading when they stop. A car that never
+moves has only an ambiguous bounding-box axis prior, transformed into world axes.
+This prior does not establish which end is the front of the car.
 
 ## Artifact bundle (`stage3-tracks-v1`)
 
@@ -103,6 +117,13 @@ calibration, frame count, and FPS still match. Frames are decoded again to recom
 appearance descriptors and diagnostics; YOLO inference alone is skipped. Loading is
 completed before atomic replacement, so using the same input/output directory is safe.
 
+The requested detector cadence must match the cache. Add
+`--detector-frame-stride 2` when reusing a fast-mode cache. New reports include hashes
+of detections, tracks, preview, map, and counts; cache reuse verifies the detections
+hash, and Unity verifies tracks and map hashes before import. Older bundles remain
+readable. Their discarded weak detections cannot be recovered by retracking; fresh
+inference is required for that improvement.
+
 ## Timing
 
 There is one clock:
@@ -112,7 +133,9 @@ timestamp_seconds = CFR_frame_index / CFR_fps
 ```
 
 Timestamps are derived rather than accumulated. Unity validates every timestamp against
-its frame number and interpolates between adjacent playback samples using this clock.
+its frame number and interpolates only between consecutive frame samples using this
+clock. When Python omits a gap, Unity holds the last supported sample for its own
+frame interval and then hides the actor until the next supported sample.
 
 ## Approximate Stage 2 scale
 
