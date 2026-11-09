@@ -5,8 +5,11 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from pathlib import Path
+
+_LOG_LOCK = threading.Lock()
 
 
 def publish_directory(staging: Path, output: Path) -> None:
@@ -40,7 +43,8 @@ def publish_directory(staging: Path, output: Path) -> None:
 
 def log(stage, msg):
     # ASCII-only output: Windows consoles on cp1252 choke on fancy characters
-    print(f"[{time.strftime('%H:%M:%S')}] [{stage}] {msg}", flush=True)
+    with _LOG_LOCK:
+        print(f"[{time.strftime('%H:%M:%S')}] [{stage}] {msg}", flush=True)
 
 
 def die(msg, code=1):
