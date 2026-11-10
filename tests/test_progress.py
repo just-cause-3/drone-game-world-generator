@@ -46,3 +46,34 @@ class ProgressTests(unittest.TestCase):
             now[0] = elapsed
             progress.update(completed)
         self.assertIn("phase ETA ~00:00:21", progress.message())
+
+    def test_failed_context_does_not_claim_completion(self):
+        progress, _, lines = self.make_progress()
+        with self.assertRaises(RuntimeError), progress:
+            progress.update(1)
+            raise RuntimeError("fixture")
+        self.assertTrue(progress.stop.is_set())
+        self.assertIn("failed/interrupted", lines[-1])
+        self.assertNotIn("100.0%", lines[-1])
+
+    def test_thread_stops_after_exception(self):
+        tick = threading.Event()
+        progress = PhaseProgress("test", "slow", interval=.01, sink=lambda *args: tick.set())
+        with self.assertRaises(ValueError), progress:
+            tick.clear()
+            self.assertTrue(tick.wait(1.))
+            raise ValueError("fixture")
+        self.assertFalse(progress.thread.is_alive())
+
+    def test_counts_cannot_go_backwards_or_exceed_total(self):
+        progress, _, _ = self.make_progress()
+        progress.update(3)
+        for invalid in (2, 11, -1):
+            with self.assertRaises(ValueError):
+                progress.update(invalid)
+
+    def test_duration_and_empty_phase(self):
+        self.assertEqual(duration(.01), "00:00:01")
+        self.assertEqual(duration(3661), "01:01:01")
+        progress, _, _ = self.make_progress(0)
+        self.assertIn("100.0%", progress.message())
