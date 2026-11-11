@@ -25,6 +25,8 @@ import cv2
 import numpy as np
 
 from .common import log
+from .progress import PhaseProgress
+from .detection_merge import suppress_tile_fragments
 from setup_inpainting_model import (
     MODEL_PATH as DEFAULT_INPAINT_MODEL,
     MODEL_SHA256 as INPAINT_MODEL_SHA256,
@@ -439,6 +441,7 @@ class _YoloForegroundMasker:
         if not self.options.foreground_full_frame and not tiled:
             candidates.extend(self._predict(frame, 0, 0, "single", confidence))
 
+        candidates = suppress_tile_fragments(candidates, frame.shape, tile_size)
         merged = _class_agnostic_nms(candidates, self.options.foreground_iou)
         mask = np.zeros(frame.shape[:2], np.uint8)
         detections = []
@@ -973,7 +976,8 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         indices = _sample_indices(frame_count, options.sample_frames)
         log("stage1", f"{source.name}: {width}x{height}, {fps:.3f} fps, "
                       f"{frame_count} frames; sampling {len(indices)}")
-        frame_audit = _frame_geometry_audit(work_source, fps, options)
+        with PhaseProgress("stage1", "camera geometry audit"):
+            frame_audit = _frame_geometry_audit(work_source, fps, options)
         audit_summary = frame_audit["summary"]
         log("stage1", f"frame audit {audit_summary['estimated_pairs']}/"
                       f"{audit_summary['frame_pairs']}; max scale step="
@@ -999,7 +1003,8 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         normalized_sharpness = np.full(len(indices), np.nan, np.float64)
         reference_slot = _reference_slot(frames, options.blur_threshold)
         reference = np.asarray(frames[reference_slot]).copy()
-        masker = _YoloForegroundMasker(options) if options.foreground_model else None
+        with PhaseProgress("stage1", "loading foreground model"):
+            masker = _YoloForegroundMasker(options) if options.foreground_model else None
         # The 92 MB ONNX graph is expensive to parse; load it only when temporal
         # reconstruction actually leaves a component too large for classical repair.
         inpainter = None
@@ -1009,6 +1014,8 @@ def _run_stage1(video, output_dir, options: Stage1Options):
         detected_classes = Counter()
         reference_detections = []
         reference_foreground_mask = np.zeros((height, width), np.uint8)
+        progress = cleanup.enter_context(PhaseProgress(
+            "stage1", "foreground detection + registration samples", len(indices)))
         if masker:
             reference_foreground_mask, reference_detections = masker.mask(reference)
         reference_features = _features(reference, options, reference_foreground_mask)
@@ -1033,6 +1040,7 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             registrations.append(metrics)
             if H is None:
                 valid[slot] = 0
+                progress.update(slot + 1, f"registered={int(accepted.sum())}")
                 continue
             transforms[slot] = H
             accepted[slot] = True
@@ -1053,6 +1061,9 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             valid[slot] = aligned_valid
             foreground[slot] = cv2.warpPerspective(
                 actor_mask, H, (width, height), flags=cv2.INTER_NEAREST)
+            progress.update(slot + 1, f"registered={int(accepted.sum())}")
+
+        progress.finish()
 
         frames.flush()
         valid.flush()
@@ -1151,9 +1162,12 @@ def _run_stage1(video, output_dir, options: Stage1Options):
             frame_transforms = _interpolate_frame_transforms(
                 frame_count, indices, transforms, accepted)
             np.save(result_dir / final_names["frame_transforms"], frame_transforms)
-            (ground, heat, holes, frequency, semantic_exclusion,
-             minimum_observations, semantic_consensus_frames) = _build_background(
-                frames, valid, foreground, accepted, options)
+            with PhaseProgress("stage1", "static background reconstruction"):
+                (ground, heat, holes, frequency, semantic_exclusion,
+                 minimum_observations, semantic_consensus_frames) = _build_background(
+                    frames, valid, foreground, accepted, options)
+            repair_progress = cleanup.enter_context(PhaseProgress(
+                "stage1", "inpainting + residual actor checks"))
             if np.any(holes) and options.learned_inpaint_model:
                 inpainter = _LamaInpainter(options)
             repaired, inpaint_mask, learned_inpaint_mask, unresolved = \
@@ -1194,6 +1208,8 @@ def _run_stage1(video, output_dir, options: Stage1Options):
                 residual_repair_pct = 100.0 * float(
                     np.mean(residual_repair_mask > 0))
 
+            repair_progress.finish()
+            log("stage1", "Writing ground artifacts and checking quality gates.")
             coverage = ground[:, :, 3] > 0
             coverage_pct = 100.0 * float(np.mean(coverage))
             inpainted_pct = 100.0 * float(np.mean(inpaint_mask > 0))
