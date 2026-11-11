@@ -30,3 +30,17 @@ class TileFragmentTests(unittest.TestCase):
         person = box([610, 270, 640, 330], "tile:0,0", kind="person")
         items = [complete, smaller, person]
         self.assertEqual(suppress_tile_fragments(items, (720, 1280), 640), items)
+
+    def test_physical_image_boundary_is_not_a_tile_seam(self):
+        items = [box([0, 200, 50, 330], "tile:0,0"), box([0, 195, 120, 335], "full")]
+        self.assertEqual(suppress_tile_fragments(items, (720, 1280), 640), items)
+
+    def test_two_nearby_cars_are_not_merged(self):
+        items = [box([140, 368, 283, 432], "tile:0,0"), box([197, 364, 337, 432], "full")]
+        self.assertEqual(suppress_tile_fragments(items, (720, 1280), 640), items)
+
+    def test_full_frame_corroboration_is_not_treated_as_clipped(self):
+        small = box([610, 270, 640, 330], "tile:0,0")
+        small["inference_passes"] = ["full", "tile:0,0"]
+        items = [small, box([600, 265, 720, 335], "tile:480,0")]
+        self.assertEqual(suppress_tile_fragments(items, (720, 1280), 640), items)
