@@ -59,6 +59,12 @@ def _stage4_resume_runners(video, run_root, assumed_world_width_m: float = 40.0)
              pipeline.get("failed_stage") == 4))
         if not resumable_status or pipeline.get("pipeline_mode") != FAST_PIPELINE_MODE:
             return None
+        completed = pipeline.get("stages") or {}
+        if (pipeline.get("failed_stage", pipeline.get("active_stage", 4)) != 4 or
+                any((completed.get(f"stage{stage}") or {}).get("pass") is not True
+                    for stage in (1, 2, 3))):
+            log("fast", "Cannot resume Stage 4: this attempt did not pass Stages 1-3.")
+            return None
         previous_width = float(pipeline.get("assumed_world_width_m", float("nan")))
         calibration_width = float((stage2.get("coordinate_system") or {}).get(
             "assumed_world_width_m", float("nan")))

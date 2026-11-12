@@ -11,8 +11,10 @@ import math
 from pathlib import Path
 import sys
 import traceback
+import time
 
 from scripts.common import log
+from scripts.progress import duration
 from scripts.stage1_ground import Stage1Options, run_stage1
 from scripts.stage2_calibration import (
     CONTROL_POINTS_SCHEMA,
@@ -114,11 +116,13 @@ def _write_approximate_control_points(
 
 
 def _stage_summary(report: dict, directory: Path) -> dict:
+    primary = directory / ("world_calibration.json" if directory.name == "stage2" else "report.json")
     return {
         "pass": report.get("pass") is True,
         "failure_reasons": list(report.get("failure_reasons") or []),
         "warnings": list(report.get("warnings") or []),
         "artifact_directory": str(directory),
+        "report_sha256": _sha256(primary) if primary.is_file() else None,
     }
 
 
@@ -139,7 +143,10 @@ def run_full_pipeline(
         stage3_runner=run_stage3, stage4_runner=run_stage4_semantics,
         stage3_options: Stage3Options | None = None,
         pipeline_mode: str = "accuracy") -> dict:
-    """Run every processing stage. Unity import is deliberately a separate caller step."""
+    """Run Stages 1-4A; operator approval and 4B/C geometry are separate steps.
+
+    Unity import is deliberately a separate caller step, not part of Python's pass.
+    """
     source = Path(video).resolve()
     root = Path(run_root).resolve()
     if not source.is_file():
@@ -148,6 +155,8 @@ def run_full_pipeline(
         raise ValueError("pipeline_mode cannot be empty")
     if not math.isfinite(assumed_world_width_m) or assumed_world_width_m <= 0.0:
         raise ValueError("assumed world width must be finite and positive")
+    tracking_options = stage3_options or Stage3Options()
+    tracking_options.validate()
     _prepare_run_root(root, source, pipeline_mode)
 
     report_path = root / "pipeline_report.json"
@@ -158,6 +167,11 @@ def run_full_pipeline(
         "pipeline_mode": pipeline_mode,
         "requires_stage4_human_review": True,
         "ready_for_stage4_geometry": False,
+        "processing_scope": "stages_1_to_4a",
+        "end_to_end_complete": False,
+        "unity_import_completed": False,
+        "pending_steps": ["unity_import", "semantic_review_and_acceptance", "stage4b_c_geometry"],
+        "active_stage": 1,
         "video": {"path": str(source), "sha256": _sha256(source)},
         "assumed_world_width_m": float(assumed_world_width_m),
         "started_utc": _utc_now(),
@@ -173,9 +187,19 @@ def run_full_pipeline(
 
     publish()
     paths = {stage: root / f"stage{stage}" for stage in range(1, 5)}
+    started = time.monotonic()
+
+    def timed(stage, runner, *args):
+        began = time.monotonic()
+        result = runner(*args)
+        log("full", f"Stage {stage} processing finished in {duration(time.monotonic() - began)}; "
+            f"pipeline elapsed {duration(time.monotonic() - started)}. "
+            "Frame ETAs cover their phase only, not the remaining pipeline.")
+        return result
+
     try:
         log("full", "Stage 1/4: validating video and reconstructing static ground")
-        stage1 = stage1_runner(source, paths[1], Stage1Options())
+        stage1 = timed(1, stage1_runner, source, paths[1], Stage1Options())
         pipeline_report["stages"]["stage1"] = _stage_summary(stage1, paths[1])
         publish()
         if stage1.get("pass") is not True:
@@ -189,15 +213,19 @@ def run_full_pipeline(
         log(
             "full",
             f"Stage 2/4: assigning approximate {assumed_world_width_m:g} m image width")
-        stage2 = stage2_runner(paths[1], controls, paths[2], Stage2Options())
+        pipeline_report["active_stage"] = 2
+        publish()
+        stage2 = timed(2, stage2_runner, paths[1], controls, paths[2], Stage2Options())
         pipeline_report["stages"]["stage2"] = _stage_summary(stage2, paths[2])
         publish()
         if stage2.get("pass") is not True:
             raise PipelineGateFailure(2, list(stage2.get("failure_reasons") or []))
 
         log("full", "Stage 3/4: detecting and tracking cars and pedestrians")
-        stage3 = stage3_runner(
-            paths[1], paths[2], paths[3], stage3_options or Stage3Options())
+        pipeline_report["active_stage"] = 3
+        publish()
+        stage3 = timed(3, stage3_runner,
+            paths[1], paths[2], paths[3], tracking_options)
         pipeline_report["stages"]["stage3"] = _stage_summary(stage3, paths[3])
         publish()
         if stage3.get("pass") is not True:
@@ -205,7 +233,9 @@ def run_full_pipeline(
 
         _release_stage_resources()
         log("full", "Stage 4/4: proposing aerial static semantic labels")
-        stage4 = stage4_runner(paths[1], paths[2], paths[4], Stage4Options())
+        pipeline_report["active_stage"] = 4
+        publish()
+        stage4 = timed(4, stage4_runner, paths[1], paths[2], paths[4], Stage4Options())
         pipeline_report["stages"]["stage4"] = _stage_summary(stage4, paths[4])
         publish()
         if stage4.get("pass") is not True:
@@ -213,6 +243,7 @@ def run_full_pipeline(
 
         pipeline_report["pass"] = True
         pipeline_report["status"] = "pass_review_required"
+        pipeline_report["active_stage"] = None
         log(
             "full",
             "PASS: Stages 1-4A passed; Stage 4 semantic review is still required")
@@ -229,12 +260,14 @@ def run_full_pipeline(
         raise
     except Exception as error:
         pipeline_report["status"] = "error"
+        pipeline_report["failed_stage"] = pipeline_report["active_stage"]
         pipeline_report["error"] = {
             "type": type(error).__name__, "message": str(error),
         }
         raise
     finally:
         pipeline_report["finished_utc"] = _utc_now()
+        pipeline_report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         publish()
     return pipeline_report
 
