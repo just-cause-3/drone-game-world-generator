@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 
 from .common import log, publish_directory
+from .progress import PhaseProgress
+from .detection_merge import suppress_tile_fragments
 from .stage1_ground import (
     DEFAULT_FOREGROUND_MODEL,
     _normalized_class_name,
@@ -440,6 +442,7 @@ class YoloActorDetector:
             "tile_overlap": self.options.detector_tile_overlap,
             "test_time_augmentation": self.options.detector_tta,
             "retains_low_confidence_for_association": True,
+            "tile_fragment_suppression": "internal-edge-containment-v1",
         }
 
     def _predict(self, frame: np.ndarray, x_offset: int, y_offset: int,
@@ -507,6 +510,7 @@ class YoloActorDetector:
                         crop, x0, y0, f"tile:{x0},{y0}"))
         if not self.options.detector_full_frame and not tiled:
             candidates.extend(self._predict(frame, 0, 0, "single"))
+        candidates = suppress_tile_fragments(candidates, frame.shape, tile_size)
         return _canonical_nms(candidates, self.options.detector_iou)
 
 
@@ -532,6 +536,7 @@ class CachedActorDetector:
         self._metadata = dict(metadata)
         self._metadata["reused_detections"] = True
         self._metadata["cache_source"] = str(self.bundle)
+        self._metadata["tile_fragment_suppression"] = "internal-edge-containment-v1"
         self.by_frame: dict[int, list[dict]] = {}
         previous_frame = -1
         with detections_path.open("r", encoding="utf-8") as stream:
@@ -596,8 +601,9 @@ class CachedActorDetector:
                 "reuse the original stride or run fresh inference")
 
     def detect(self, frame: np.ndarray, frame_index: int) -> list[dict]:
-        del frame
-        return [dict(item) for item in self.by_frame.get(frame_index, [])]
+        candidates = [dict(item) for item in self.by_frame.get(frame_index, [])]
+        return suppress_tile_fragments(
+            candidates, frame.shape, int(self._metadata.get("tile_size", 0)))
 
 
 class _Track:
@@ -1030,7 +1036,8 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
     output = Path(output_directory).resolve()
     _validate_output_target(output)
     inputs = _load_inputs(stage1_bundle, stage2_bundle)
-    detector = detector or YoloActorDetector(options)
+    with PhaseProgress("stage3", "loading actor detector"):
+        detector = detector or YoloActorDetector(options)
     if not hasattr(detector, "detect") or not hasattr(detector, "metadata"):
         raise TypeError("detector must expose detect(frame, frame_index) and metadata")
     validate_inputs = getattr(detector, "validate_inputs", None)
@@ -1069,7 +1076,8 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
         inference_frames = 0
         out_of_bounds_count = 0
         out_of_bounds_detections = []
-        with detections_path.open("w", encoding="utf-8", newline="\n") as detection_file, \
+        with PhaseProgress("stage3", "tracking frames", inputs["frame_count"]) as progress, \
+                detections_path.open("w", encoding="utf-8", newline="\n") as detection_file, \
                 counts_path.open("w", encoding="utf-8", newline="") as counts_file:
             counts_writer = csv.writer(counts_file)
             counts_writer.writerow([
@@ -1180,11 +1188,9 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                     frame, mapped, processed, inputs["fps"],
                     options.preview_line_thickness))
                 processed += 1
-                if processed % 5 == 0 or processed == inputs["frame_count"]:
-                    log(
-                        "stage3",
-                        f"frames {processed}/{inputs['frame_count']}; "
-                        f"detections={total_count}; tracks_started={tracker.next_identifier - 1}")
+                progress.update(processed,
+                                f"detections={total_count}; tracks_started={tracker.next_identifier - 1}; "
+                                f"inference_frames={inference_frames}")
         capture.release()
         capture = None
         writer.release()
@@ -1194,6 +1200,7 @@ def run_stage3(stage1_bundle, stage2_bundle, output_directory="stage3_out",
                 f"CFR decoder produced {processed} frames; Stage 1 declares "
                 f"{inputs['frame_count']}")
 
+        log("stage3", "Finalizing tracks, smoothing trajectories and exporting artifacts; frame ETA excluded this work.")
         all_tracks = tracker.all_tracks()
         observation_confirmed = [
             track for track in all_tracks
