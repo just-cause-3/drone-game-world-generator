@@ -64,6 +64,10 @@ class FullPipelineTests(unittest.TestCase):
         self.assertEqual("accuracy", report["pipeline_mode"])
         self.assertTrue(report["requires_stage4_human_review"])
         self.assertFalse(report["ready_for_stage4_geometry"])
+        self.assertFalse(report["end_to_end_complete"])
+        self.assertFalse(report["unity_import_completed"])
+        self.assertEqual("stages_1_to_4a", report["processing_scope"])
+        self.assertIn("stage4b_c_geometry", report["pending_steps"])
         saved = json.loads(
             (self.run_root / "pipeline_report.json").read_text(encoding="utf-8"))
         self.assertEqual(PIPELINE_SCHEMA, saved["schema_version"])
@@ -97,6 +101,34 @@ class FullPipelineTests(unittest.TestCase):
         self.assertEqual("quality_gate_failed", report["status"])
         self.assertEqual(1, report["failed_stage"])
         self.assertEqual(["camera cut detected"], report["failure_reasons"])
+
+    def test_invalid_scale_rejected_before_creating_run_or_processing(self):
+        for width in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(width=width), self.assertRaisesRegex(ValueError, "finite and positive"):
+                run_full_pipeline(self.video, self.run_root, width)
+            self.assertFalse(self.run_root.exists())
+
+    def test_every_gate_and_exception_stops_downstream_stages(self):
+        for failing in (1, 2, 3, 4):
+            for crash in (False, True):
+                with self.subTest(failing=failing, crash=crash):
+                    calls = []
+                    def runner(stage):
+                        def run(*args):
+                            calls.append(stage)
+                            if stage == failing and crash:
+                                raise RuntimeError("fixture failure")
+                            return {"pass": stage != failing, "input": {"width": 32, "height": 24},
+                                    "failure_reasons": ["fixture rejection"] if stage == failing else []}
+                        return run
+                    with self.assertRaises(RuntimeError if crash else PipelineGateFailure):
+                        run_full_pipeline(self.video, self.run_root,
+                                          **{f"stage{s}_runner": runner(s) for s in (1, 2, 3, 4)})
+                    self.assertEqual(calls, list(range(1, failing + 1)))
+                    report = json.loads((self.run_root / "pipeline_report.json").read_text())
+                    self.assertFalse(report["pass"])
+                    self.assertEqual(failing, report["failed_stage"])
+                    self.assertEqual("error" if crash else "quality_gate_failed", report["status"])
 
     def test_refuses_unowned_nonempty_run_directory(self):
         self.run_root.mkdir()

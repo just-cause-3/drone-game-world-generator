@@ -43,6 +43,7 @@ class FastPipelineTests(unittest.TestCase):
                 "status": "error",
                 "pipeline_mode": FAST_PIPELINE_MODE,
                 "assumed_world_width_m": 40.0,
+                "stages": {f"stage{i}": {"pass": True} for i in (1, 2, 3)},
                 "video": {"path": str(video), "sha256": video_hash},
             }))
             stage1 = run / "stage1"
@@ -82,6 +83,17 @@ class FastPipelineTests(unittest.TestCase):
             self.assertTrue(runners[0](None, None, None)["pass"])
             self.assertTrue(runners[1](None, None, None, None)["pass"])
             self.assertTrue(runners[2](None, None, None, None)["pass"])
+            pipeline_path = run / "pipeline_report.json"
+            original_pipeline = pipeline_path.read_text()
+            attempt = json.loads(original_pipeline)
+            attempt["failed_stage"] = 2
+            pipeline_path.write_text(json.dumps(attempt))
+            self.assertIsNone(_stage4_resume_runners(video, run))
+            attempt.pop("failed_stage")
+            attempt["stages"] = {}
+            pipeline_path.write_text(json.dumps(attempt))
+            self.assertIsNone(_stage4_resume_runners(video, run))
+            pipeline_path.write_text(original_pipeline)
             self.assertIsNone(_stage4_resume_runners(video, run, 80.0))
 
             tracks = run / "stage3" / "tracks.json"
