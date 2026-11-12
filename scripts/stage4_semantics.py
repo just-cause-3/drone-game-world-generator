@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from .common import log, publish_directory
+from .progress import PhaseProgress
 from .stage1_ground import _tile_origins
 from .track_agents import resolve_device
 from setup_stage4_model import (
@@ -711,19 +712,22 @@ def run_stage4_semantics(stage1_bundle, stage2_bundle,
     _validate_output_target(output)
     if provider is not None and external_labels is not None:
         raise ValueError("provide either a semantic provider or external labels, not both")
-    if provider is None:
-        if external_labels:
-            provider = ExternalLabelProvider(external_labels)
-        elif options.semantic_backend == "hybrid-openearthmap-road":
-            provider = HybridOpenEarthMapRoadProvider(options)
-        elif options.semantic_backend == "openearthmap-mask2former":
-            provider = OpenEarthMapMask2FormerProvider(options)
-        else:
-            provider = YoloSemanticProvider(options)
+    with PhaseProgress("stage4", "loading semantic models"):
+        if provider is None:
+            if external_labels:
+                provider = ExternalLabelProvider(external_labels)
+            elif options.semantic_backend == "hybrid-openearthmap-road":
+                provider = HybridOpenEarthMapRoadProvider(options)
+            elif options.semantic_backend == "openearthmap-mask2former":
+                provider = OpenEarthMapMask2FormerProvider(options)
+            else:
+                provider = YoloSemanticProvider(options)
 
     log("stage4", f"semantic provider={provider.metadata.get('implementation', 'custom')}")
-    raw_labels = _validate_labels(
-        provider.predict(inputs["ground"]), inputs["height"], inputs["width"])
+    with PhaseProgress("stage4", "semantic inference (full frame, tiles and TTA)"):
+        raw_labels = _validate_labels(
+            provider.predict(inputs["ground"]), inputs["height"], inputs["width"])
+    log("stage4", "Cleaning labels, validating semantics and exporting review artifacts.")
     predicted_outside_valid = int(np.count_nonzero(raw_labels[~inputs["valid"]]))
     raw_labels[~inputs["valid"]] = CANONICAL_IDS["unknown"]
     labels, cleanup = _clean_components(
