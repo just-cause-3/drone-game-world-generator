@@ -15,7 +15,8 @@ namespace DroneWorld.Stage3
         [SerializeField, Min(0f)] private float playbackSpeed = 1f;
         [SerializeField] private bool tintEstimatedSamples;
         [SerializeField] private bool showStationaryCars;
-        [SerializeField] private bool showStationaryPeople;
+        [SerializeField, Tooltip("Keep confirmed waiting pedestrians visible. Disabling this can hide real people at crossings.")]
+        private bool showStationaryPeople = true;
         [SerializeField, Min(0f)] private float stationaryMovementThreshold = 0.5f;
 
         private readonly List<ActorInstance> actors = new List<ActorInstance>();

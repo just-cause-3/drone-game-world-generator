@@ -16,6 +16,11 @@ namespace DroneWorld.Stage3.Editor
                 controller.RebuildVisibleActors();
             Stage3TrackAsset tracks = controller.TrackAsset;
 
+            if (!serializedObject.FindProperty("showStationaryPeople").boolValue)
+                EditorGUILayout.HelpBox(
+                    "Stationary pedestrians are hidden. This can remove real people waiting at crossings; " +
+                    "enable Show Stationary People to include confirmed tracks.", MessageType.Warning);
+
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Playback", EditorStyles.boldLabel);
             if (!Application.isPlaying)

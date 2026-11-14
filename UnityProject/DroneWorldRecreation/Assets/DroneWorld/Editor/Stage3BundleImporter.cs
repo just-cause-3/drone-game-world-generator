@@ -47,7 +47,7 @@ namespace DroneWorld.Stage3.Editor
         }
 
         internal static Stage3TrackAsset ImportBundle(
-            string bundleDirectory, Stage2CalibrationAsset calibration)
+            string bundleDirectory, Stage2CalibrationAsset calibration, bool rebuildScene = true)
         {
             if (calibration == null || !calibration.IsUsable)
                 throw new InvalidDataException(
@@ -120,7 +120,8 @@ namespace DroneWorld.Stage3.Editor
             asset.Tracks = ConvertTracks(tracks.tracks);
             EditorUtility.SetDirty(asset);
             AssetDatabase.SaveAssets();
-            Stage3SceneBuilder.BuildPlaybackScene(assetPath);
+            if (rebuildScene)
+                Stage3SceneBuilder.BuildPlaybackScene(assetPath);
             asset = AssetDatabase.LoadAssetAtPath<Stage3TrackAsset>(assetPath);
             if (asset == null)
                 throw new InvalidDataException(

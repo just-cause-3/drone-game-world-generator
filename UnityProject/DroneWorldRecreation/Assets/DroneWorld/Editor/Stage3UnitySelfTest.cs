@@ -2,6 +2,8 @@ using System;
 using System.Reflection;
 using DroneWorld.Stage3;
 using UnityEngine;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 
 namespace DroneWorld.Stage3.Editor
 {
@@ -10,6 +12,12 @@ namespace DroneWorld.Stage3.Editor
     {
         public static void Run()
         {
+            if (Application.isPlaying)
+                throw new InvalidOperationException("Run the self-test outside Play Mode.");
+            Scene originalScene = SceneManager.GetActiveScene();
+            Scene testScene = EditorSceneManager.NewScene(
+                NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+            SceneManager.SetActiveScene(testScene);
             var data = ScriptableObject.CreateInstance<Stage3TrackAsset>();
             var root = new GameObject("Stage3 playback test");
             var template = new GameObject("Actor test template");
@@ -31,16 +39,29 @@ namespace DroneWorld.Stage3.Editor
                             Sample(5, 5f, -170f), Sample(6, 6f, -170f),
                         },
                     },
+                    new Stage3ActorTrack
+                    {
+                        Id = 2, Kind = Stage3ActorKind.Person,
+                        Samples = new[] { Sample(0, 3f, 0f), Sample(1, 3f, 0f) },
+                    },
+                    new Stage3ActorTrack
+                    {
+                        Id = 3, Kind = Stage3ActorKind.Car,
+                        Samples = new[] { Sample(0, 8f, 0f), Sample(1, 8f, 0f) },
+                    },
                 };
                 var controller = root.AddComponent<Stage3PlaybackController>();
                 controller.Configure(data, template, template);
                 typeof(Stage3PlaybackController).GetMethod(
                     "BuildActors", BindingFlags.NonPublic | BindingFlags.Instance)!
                     .Invoke(controller, null);
-                Require(root.transform.childCount == 1, "Expected one actor.");
+                Require(root.transform.childCount == 2,
+                    "Keep the moving car and waiting pedestrian; parked cars remain opt-in.");
                 Transform actor = root.transform.GetChild(0);
 
                 controller.Seek(0.05f);
+                Require(root.transform.GetChild(1).gameObject.activeSelf,
+                    "A confirmed pedestrian must not disappear solely for standing still.");
                 Require(actor.gameObject.activeSelf, "Consecutive observations must be visible.");
                 Require(Mathf.Abs(actor.position.x - 0.5f) < 1e-5f, "Consecutive samples must interpolate.");
                 Require(Mathf.Abs(actor.position.y - 2f) < 1e-5f, "Ground elevation must be preserved.");
@@ -64,6 +85,8 @@ namespace DroneWorld.Stage3.Editor
                 UnityEngine.Object.DestroyImmediate(root);
                 UnityEngine.Object.DestroyImmediate(template);
                 UnityEngine.Object.DestroyImmediate(data);
+                if (originalScene.IsValid()) SceneManager.SetActiveScene(originalScene);
+                EditorSceneManager.CloseScene(testScene, true);
             }
         }
 
