@@ -9,6 +9,7 @@ using DroneWorld.Stage2;
 using DroneWorld.Stage2.Editor;
 using DroneWorld.Stage3.Editor;
 using DroneWorld.Stage4.Editor;
+using DroneWorld.Stage4Geometry.Editor;
 using UnityEditor;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
@@ -24,6 +25,17 @@ namespace DroneWorld.FullPipeline.Editor
         public string status;
         public int failed_stage;
         public string[] failure_reasons;
+        public FullPipelineStageSummaries stages;
+    }
+
+    [Serializable] internal sealed class FullPipelineStageSummaries
+    {
+        public FullPipelineStageSummary stage1, stage2, stage3, stage4;
+    }
+    [Serializable] internal sealed class FullPipelineStageSummary
+    {
+        public bool pass;
+        public string report_sha256;
     }
 
     [InitializeOnLoad]
@@ -34,9 +46,12 @@ namespace DroneWorld.FullPipeline.Editor
         private static readonly List<string> GateFailures = new();
         private static Process process;
         private static string runRoot;
+        private static bool importing;
+        private static bool reloadLocked;
 
         public static event Action Changed;
-        public static bool IsRunning => process != null && !process.HasExited;
+        // An exited child remains busy until Update consumes its result/imports it.
+        public static bool IsRunning => process != null || importing;
         public static string Status { get; private set; } = "Ready";
         public static IReadOnlyList<string> LogLines => OutputLines;
         public static IReadOnlyList<string> FailureReasons => GateFailures;
@@ -58,6 +73,7 @@ namespace DroneWorld.FullPipeline.Editor
 
         public static void ImportPassingRun(string runDirectory)
         {
+            RequireEditMode();
             if (IsRunning)
                 throw new InvalidOperationException(
                     "Wait for the running pipeline process to finish before importing.");
@@ -67,14 +83,25 @@ namespace DroneWorld.FullPipeline.Editor
             OutputLines.Clear();
             GateFailures.Clear();
             Append($"Importing existing passing run: {runRoot}");
-            ImportValidatedBundles();
-            Append(Status);
-            Changed?.Invoke();
+            importing = true;
+            try { ImportValidatedBundles(); }
+            catch
+            {
+                Status = "IMPORT FAILED - Python artifacts preserved; Unity import may be partial.";
+                throw;
+            }
+            finally
+            {
+                importing = false;
+                Append(Status);
+                Changed?.Invoke();
+            }
         }
 
         private static void StartInternal(
             string videoPath, string runDirectory, float worldWidth, bool fastMode)
         {
+            RequireEditMode();
             if (IsRunning)
                 throw new InvalidOperationException("The full pipeline is already running.");
             if (string.IsNullOrWhiteSpace(videoPath))
@@ -88,6 +115,9 @@ namespace DroneWorld.FullPipeline.Editor
             string video = Path.GetFullPath(videoPath);
             if (!File.Exists(video))
                 throw new FileNotFoundException("Input video does not exist.", video);
+            string folderProblem = PipelineRunFolder.Problem(video, runDirectory, fastMode);
+            if (folderProblem != null)
+                throw new ArgumentException(folderProblem + " Use a new folder under the repository's runs directory.");
             string repository = RepositoryRoot;
             string python = Path.Combine(repository, ".venv", "Scripts", "python.exe");
             string scriptName = fastMode ? "fast_pipeline.py" : "full_pipeline.py";
@@ -141,10 +171,28 @@ namespace DroneWorld.FullPipeline.Editor
             process = new Process { StartInfo = startInfo };
             process.OutputDataReceived += CaptureLine;
             process.ErrorDataReceived += CaptureLine;
-            if (!process.Start())
-                throw new InvalidOperationException("Failed to start the full pipeline.");
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+            // Prevent script reloads from losing the process handle/run folder.
+            EditorApplication.LockReloadAssemblies();
+            reloadLocked = true;
+            try
+            {
+                if (!process.Start())
+                    throw new InvalidOperationException("Failed to start the full pipeline.");
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+            }
+            catch
+            {
+                if (process != null)
+                {
+                    try { if (!process.HasExited) process.Kill(); }
+                    catch (InvalidOperationException) { }
+                    process.Dispose();
+                    process = null;
+                }
+                ReleaseReloadLock();
+                throw;
+            }
             Status = "Running Stage 1 of 4...";
             Changed?.Invoke();
         }
@@ -174,44 +222,72 @@ namespace DroneWorld.FullPipeline.Editor
                 Changed?.Invoke();
             if (process == null || !process.HasExited)
                 return;
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                Status = "Processing finished. Exit Play Mode to finish the pipeline and import results.";
+                Changed?.Invoke();
+                return;
+            }
 
-            process.WaitForExit();
-            int exitCode = process.ExitCode;
-            process.Dispose();
-            process = null;
-            while (PendingLines.TryDequeue(out string line))
-                Append(line);
+            importing = true;
+            try
+            {
+                process.WaitForExit();
+                int exitCode = process.ExitCode;
+                process.Dispose();
+                process = null;
+                while (PendingLines.TryDequeue(out string line))
+                    Append(line);
 
-            if (exitCode == 0)
-            {
-                try
+                if (exitCode == 0)
                 {
-                    ImportValidatedBundles();
+                    try
+                    {
+                        ImportValidatedBundles();
+                    }
+                    catch (Exception exception)
+                    {
+                        Status = "IMPORT FAILED - Python artifacts preserved; Unity import may be partial.";
+                        Append(exception.ToString());
+                        Debug.LogException(exception);
+                    }
                 }
-                catch (Exception exception)
+                else if (exitCode == 2)
                 {
-                    Status = "Unity import failed. Generated Python artifacts were preserved.";
-                    Append(exception.ToString());
-                    Debug.LogException(exception);
+                    ReadGateFailure();
+                    Status = "QUALITY GATE FAILED - no bundles were imported into Unity.";
                 }
+                else
+                {
+                    ReadGateFailure();
+                    Status = $"Pipeline process failed with exit code {exitCode}; Unity was not changed.";
+                }
+                Append(Status);
+                Changed?.Invoke();
             }
-            else if (exitCode == 2)
+            finally
             {
-                ReadGateFailure();
-                Status = "QUALITY GATE FAILED - no bundles were imported into Unity.";
+                importing = false;
+                ReleaseReloadLock();
             }
-            else
-            {
-                ReadGateFailure();
-                Status = $"Pipeline process failed with exit code {exitCode}; Unity was not changed.";
-            }
-            Append(Status);
-            Changed?.Invoke();
+        }
+
+        private static void RequireEditMode()
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+                throw new InvalidOperationException("Exit Play Mode before running or importing the pipeline.");
+        }
+
+        private static void ReleaseReloadLock()
+        {
+            if (!reloadLocked) return;
+            reloadLocked = false;
+            EditorApplication.UnlockReloadAssemblies();
         }
 
         private static void ImportValidatedBundles()
         {
-            ValidatePipelineReport();
+            FullPipelineValidation.Validate(runRoot);
             Status = "Processing passed. Importing all bundles into Unity...";
             Changed?.Invoke();
             Stage1ArtifactManifest manifest = Stage1BundleImporter.ImportBundle(
@@ -233,8 +309,8 @@ namespace DroneWorld.FullPipeline.Editor
             Stage4BundleImporter.ImportBundle(
                 Path.Combine(runRoot, "stage4"), calibration);
             Status =
-                "PASS - Stages 1-3 imported; Stage 4A review scene opened. " +
-                "Review/acceptance and Stage 4B geometry remain manual.";
+                "STAGES 1-4A COMPLETE - actor playback and semantic review imported. " +
+                "NOT the final 3D world: review/acceptance and Stage 4B-C geometry are next.";
         }
 
         private static void StatusFromLine(string line)
@@ -250,15 +326,6 @@ namespace DroneWorld.FullPipeline.Editor
             if (!File.Exists(path))
                 throw new FileNotFoundException("pipeline_report.json is missing.", path);
             return JsonUtility.FromJson<FullPipelineReportData>(File.ReadAllText(path));
-        }
-
-        private static void ValidatePipelineReport()
-        {
-            FullPipelineReportData report = ReadReport();
-            if (report == null || report.schema_version != "droneworld-full-pipeline-v1")
-                throw new InvalidDataException("The full-pipeline report schema is invalid.");
-            if (!report.pass || report.status != "pass_review_required")
-                throw new InvalidDataException("The full-pipeline report does not pass.");
         }
 
         private static void ReadGateFailure()
@@ -311,6 +378,7 @@ namespace DroneWorld.FullPipeline.Editor
         private string runPath;
         private float worldWidth;
         private Vector2 logScroll;
+        private bool importScheduled;
 
         [MenuItem("Drone World/Run Full Pipeline (Stages 1-4A)...", priority = 1)]
         public static void ShowWindow()
@@ -334,6 +402,8 @@ namespace DroneWorld.FullPipeline.Editor
         private void OnDisable()
         {
             FullPipelineRunner.Changed -= OnRunnerChanged;
+            EditorApplication.delayCall -= ExecuteScheduledImport;
+            importScheduled = false;
         }
 
         private void OnRunnerChanged()
@@ -351,20 +421,30 @@ namespace DroneWorld.FullPipeline.Editor
             EditorGUILayout.HelpBox(
                 "One click runs Stages 1, 2, 3, and 4A in an isolated folder. " +
                 "Stage 2 uses an approximate operator-chosen image width. Stage 4A " +
-                "still requires human review and does not yet create 3D buildings.",
+                "still requires human review. This command stops BEFORE Stage 4B-C " +
+                "3D geometry; it never automatically approves semantic labels.",
                 MessageType.Info);
 
-            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning))
+            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning || EditorApplication.isPlayingOrWillChangePlaymode))
             {
                 DrawVideoField();
                 DrawRunField();
                 worldWidth = EditorGUILayout.FloatField(
                     "Approx. image width (m)", worldWidth);
+                EditorGUILayout.HelpBox("Output folder, NOT the folder containing videos. A new path is created automatically.", MessageType.None);
+                if (GUILayout.Button("Use New Run Folder"))
+                    runPath = PipelineRunFolder.Suggested(videoPath, false);
             }
-            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning))
+            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning || EditorApplication.isPlayingOrWillChangePlaymode || importScheduled))
             {
                 if (GUILayout.Button("Run Stages 1-4A", GUILayout.Height(36f)))
                     RunPipeline();
+                if (GUILayout.Button("Import Existing Passing Run (No Processing)", GUILayout.Height(28f)))
+                {
+                    EditorPrefs.SetString(RunPreference, runPath);
+                    importScheduled = true;
+                    EditorApplication.delayCall += ExecuteScheduledImport;
+                }
             }
 
             EditorGUILayout.Space(8f);
@@ -374,6 +454,7 @@ namespace DroneWorld.FullPipeline.Editor
                 : FullPipelineRunner.Status.Contains("FAIL")
                     ? MessageType.Error : MessageType.None;
             EditorGUILayout.HelpBox(FullPipelineRunner.Status, type);
+            DrawRemainingSteps();
             foreach (string reason in FullPipelineRunner.FailureReasons)
                 EditorGUILayout.HelpBox(reason, MessageType.Error);
 
@@ -428,6 +509,9 @@ namespace DroneWorld.FullPipeline.Editor
         {
             try
             {
+                string confirmed = PipelineRunFolder.Confirm(videoPath, runPath, false);
+                if (confirmed == null) return;
+                runPath = confirmed;
                 EditorPrefs.SetString(VideoPreference, videoPath);
                 EditorPrefs.SetString(RunPreference, runPath);
                 EditorPrefs.SetFloat(WidthPreference, worldWidth);
@@ -439,6 +523,28 @@ namespace DroneWorld.FullPipeline.Editor
                 EditorUtility.DisplayDialog(
                     "Could not start full pipeline", exception.Message, "OK");
             }
+        }
+
+        private void ExecuteScheduledImport()
+        {
+            importScheduled = false;
+            try { FullPipelineRunner.ImportPassingRun(runPath); }
+            catch (Exception exception)
+            {
+                Debug.LogException(exception);
+                EditorUtility.DisplayDialog("Could not import passing run", exception.Message, "OK");
+            }
+        }
+
+        internal static void DrawRemainingSteps()
+        {
+            EditorGUILayout.HelpBox(
+                "To finish: select the Stage 4A review root in the Hierarchy, inspect/correct " +
+                "the map and explicitly accept it. Then generate the Stage 4B-C world. " +
+                "A passing processing report is not proof of reconstruction accuracy.", MessageType.Info);
+            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning || EditorApplication.isPlayingOrWillChangePlaymode))
+                if (GUILayout.Button("Next: Open Stage 4B-C Geometry (Acceptance Required)"))
+                    EditorApplication.delayCall += Stage4GeometryPipelineWindow.OpenWindow;
         }
     }
 }
