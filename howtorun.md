@@ -142,8 +142,11 @@ are supported. Avoid cuts, sudden zoom jumps, and strongly angled footage.
    D:\drone-game-world-generator-usin-cv\runs\perfect_top_down_v2_full
    ```
 
-   **The folder does not have to exist. The pipeline creates it.** Use the text field
-   when entering a new path; the folder picker is for existing folders.
+   **The folder does not have to exist. The pipeline creates it.** You can also click
+   **Use New Run Folder** to fill in a safe unused output path automatically.
+   Do **not** select `sample_vids`, the repository root, or the Unity project folder.
+   If you accidentally select a non-empty unrelated folder, the window offers a
+   new folder under `runs`; click **Use New Run Folder** in the confirmation dialog.
 5. Set **Approx. image width (m)** to `40` for a first test without measurements.
    This makes the whole ground image approximately 40 Unity units wide; it is not
    the width of one road or a detected measurement.
@@ -154,11 +157,66 @@ are supported. Avoid cuts, sudden zoom jumps, and strongly angled footage.
 The pipeline automatically creates the ground, assigns coordinates, tracks cars and
 people, and proposes the static labels. No manual ground markers are needed in this mode.
 
-**Success:** the status begins with `PASS`, and `Stage4SemanticReview.unity` opens.
+**Success:** the status says `STAGES 1-4A COMPLETE`, and `Stage4SemanticReview.unity` opens.
 The colored overlay is a review map, not the finished 3D world.
+
+Despite the menu's **Run Full Pipeline** name, this is the full **automatic
+processing portion (1-4A)**, not unattended completion of the final 3D world.
+Continue with Step 6 (review/accept) and Step 7 (generate Stage 4B-C geometry).
+The pipeline window's **Next: Open Stage 4B-C Geometry (Acceptance Required)**
+button opens that tool; it does not approve labels or bypass the review gate.
 
 **Failure:** read the failed stage and reason in the pipeline window. The automated
 run stops; do not continue to geometry as if it passed.
+
+### Progress and ETA in the logs
+
+New runs show elapsed time, completed frames/samples, percentage, and a **phase ETA**
+for Stage 1 detection/registration and Stage 3 tracking. For example (illustrative):
+
+```text
+[stage1] foreground detection + registration samples 12/41 (29.3%); elapsed 00:02:00; phase ETA ~00:04:50; 10.00 s/item
+```
+
+The estimate starts after three completed items and includes tile/TTA work. It is
+approximate and can change as processing speed changes. Heartbeats appear about
+every 15 seconds during these phases, including while waiting on a slow frame.
+Model loading, ground repair and semantic inference show elapsed-time heartbeats
+with `phase ETA unavailable` because their remaining work is variable. If an item
+takes unusually long, the log says `ETA recalculating` rather than counting down
+to a misleading zero. A heartbeat means the process is alive, not that the GPU
+has completed an inference step.
+
+**Phase ETA is not the time remaining for the whole pipeline.** Reconstruction,
+repair, later stages, and Unity import can still remain after the frame ETA reaches
+zero. The full runner also logs each stage's duration and total elapsed time.
+Code updates do not add ETA to an already-running Python process; let it finish
+and use these logs on the next run.
+
+### What is an isolated run folder?
+
+It is a dedicated **output folder for one video and one processing mode**. It is
+not the folder containing the input video, and it is not a second Unity project.
+
+For a new input `sample_vids\my_road.mp4`, use:
+
+```text
+runs\my_road_full\
+    pipeline_report.json       Overall processing status
+    stage1\                    Static ground and stabilized-video artifacts
+    stage2\                    Approximate world-coordinate calibration
+    stage3\                    Car/person tracks and preview video
+    stage4\                    Semantic proposal and review artifacts
+        geometry\              Created later when you run Stage 4B-C
+```
+
+The hidden `.droneworld-full-pipeline-run` marker identifies the folder's input
+video and mode. Do not create or edit that marker yourself to bypass an error.
+Keep different videos and normal/fast runs separate (`my_road_full` versus
+`my_road_fast`). Reusing a recognized folder for the same video/mode reruns and
+replaces generated results; use a new folder if you want to keep an earlier run.
+Separate run folders preserve external artifacts; Unity's generated scene names
+are still shared, so import the run you want to view.
 
 ### Want a faster run?
 
@@ -247,16 +305,39 @@ If the scenes are already imported, simply open `Stage4GeneratedWorld.unity` and
 If you need to import a completed run again:
 
 1. Exit Play Mode.
-2. Open **Drone World -> Run Full Pipeline - Fast Mode (Stages 1-4A)...**.
+2. Open **Drone World -> Run Full Pipeline (Stages 1-4A)...**.
 3. Set the run-folder field to the existing completed run's **parent folder**,
    such as `runs\perfect_top_down_v2_full`, not its `stage1` or `stage4` subfolder.
-4. Click **Import Existing Passing Fast Run**. Despite its name, the current import
-   action accepts a passing normal or fast run. It imports files without inference.
+4. Click **Import Existing Passing Run (No Processing)**. This accepts a passing
+   normal or fast run and imports files without inference. The fast-mode window's
+   **Import Existing Passing Fast Run** button also supports both modes.
 5. Continue from Step 6. Existing acceptance remains usable only if the exact map
    and report still match. In the geometry window, **Import Existing Passing Geometry
    Bundle** lets you reuse a matching completed `stage4\geometry` bundle.
 
 Do not click a **Run** button just to reopen results: it can repeat processing.
+
+## Check playback against the video
+
+1. Open `Stage4GeneratedWorld` (or `Stage3ActorPlayback`) and exit Play Mode.
+2. Select **Drone World -> Diagnostics -> Check Current Scene Playback**.
+3. Leave Unity running while it plays one clip cycle, captures frames, tests
+   timeline seeking, and exits Play Mode automatically. It does not save the scene.
+4. Open `UnityProject\DroneWorldRecreation\Temp\DroneWorldPlaybackCheck\report.json`.
+   `passed: true` means the playback smoke test found no runtime errors; it does
+   **not** mean detections are perfectly accurate. The adjacent `topdown_*.png`
+   captures use the ground reference scale, whereas the input video may zoom.
+
+If a real pedestrian disappears while waiting, select **Stage 3 Real Track Playback**
+in the Hierarchy and enable **Show Stationary People** in the Inspector. New scenes
+enable this by default; older scenes may still have it disabled.
+
+To use a newly processed Stage 3 bundle without rebuilding the existing world,
+save your scene, exit Play Mode, and choose **Drone World -> Diagnostics -> Refresh
+Tracks In Current World...**. Select the new `stage3` folder. Its Stage 1/2 provenance
+must match the current world. This updates the imported tracks, enables confirmed
+stationary pedestrians, and saves the scene; it does not rerun video inference or
+change accepted semantic geometry. Keep the previous external bundle for rollback.
 
 ## Troubleshooting
 
@@ -264,6 +345,7 @@ Do not click a **Run** button just to reopen results: it can repeat processing.
 | --- | --- |
 | No **Drone World** menu | Wait for compilation, then check Unity's Console for red compile errors. Confirm you opened `UnityProject\DroneWorldRecreation`. |
 | Missing model or Python environment | Complete Steps 2-3 in the repository folder. |
+| `refusing to use unrelated non-empty run directory` | You selected an input/shared folder such as `sample_vids`. Click **Use New Run Folder**, or enter `D:\drone-game-world-generator-usin-cv\runs\my_video_full`. Never remove input files to make this error disappear. |
 | CUDA is false / the run is very slow | Run `nvidia-smi` in PowerShell. If it cannot see the GPU, check the NVIDIA driver. If it can, check the project's PyTorch CUDA installation using the official selector linked in Step 2. A CUDA-enabled package still needs a working compatible driver. |
 | A run folder is missing | Type the full new path into the run-folder text field. The pipeline creates it. |
 | The log has not changed for a while | One detector pass can be slow, especially on CPU. Check Task Manager for the Python process and its CPU/GPU activity before starting another run. |
