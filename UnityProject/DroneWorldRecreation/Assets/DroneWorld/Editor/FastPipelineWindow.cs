@@ -59,15 +59,19 @@ namespace DroneWorld.FullPipeline.Editor
                 "Balanced fast mode keeps the original resolution, overlapping aerial " +
                 "tiles, and test-time augmentation. Stage 3 detects alternate frames, " +
                 "then tracks/interpolates actors on the full source frame clock. Use a " +
-                "separate *_fast run folder; the original maximum-accuracy command is unchanged.",
+                "separate *_fast run folder. Stops at semantic review (4A); approval " +
+                "and Stage 4B-C geometry are still required for the final world.",
                 MessageType.Info);
 
-            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning))
+            using (new EditorGUI.DisabledScope(FullPipelineRunner.IsRunning || importScheduled || EditorApplication.isPlayingOrWillChangePlaymode))
             {
                 DrawVideoField();
                 DrawRunField();
                 worldWidth = EditorGUILayout.FloatField(
                     "Approx. image width (m)", worldWidth);
+                EditorGUILayout.HelpBox("Output folder, NOT the folder containing videos. A new path is created automatically.", MessageType.None);
+                if (GUILayout.Button("Use New Run Folder"))
+                    runPath = PipelineRunFolder.Suggested(videoPath, true);
                 if (GUILayout.Button("Run Stages 1-4A - Fast", GUILayout.Height(36f)))
                     RunPipeline();
                 if (GUILayout.Button(
@@ -82,6 +86,7 @@ namespace DroneWorld.FullPipeline.Editor
                 : FullPipelineRunner.Status.Contains("FAIL")
                     ? MessageType.Error : MessageType.None;
             EditorGUILayout.HelpBox(FullPipelineRunner.Status, type);
+            FullPipelineWindow.DrawRemainingSteps();
             foreach (string reason in FullPipelineRunner.FailureReasons)
                 EditorGUILayout.HelpBox(reason, MessageType.Error);
 
@@ -137,6 +142,9 @@ namespace DroneWorld.FullPipeline.Editor
         {
             try
             {
+                string confirmed = PipelineRunFolder.Confirm(videoPath, runPath, true);
+                if (confirmed == null) return;
+                runPath = confirmed;
                 EditorPrefs.SetString(VideoPreference, videoPath);
                 EditorPrefs.SetString(RunPreference, runPath);
                 EditorPrefs.SetFloat(WidthPreference, worldWidth);
