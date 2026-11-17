@@ -155,4 +155,84 @@ Stage 4A runs Mask2Former~\cite{cheng2022mask2former} in the aerial OpenEarthMap
 
 After exact-map acceptance, Stage 4B/C converts connected regions into editable geometry. Surface classes remain on the textured collision plane. Building contours are simplified, mapped through $H$, triangulated, and extruded only with a visibly declared height policy; vegetation proxies are opt-in. This separation is essential because a stationary top-down video sees roofs but supplies neither facade evidence nor building height. Any later change to labels invalidates acceptance and blocks regeneration until reviewed again.
 
+\section{Experimental Evaluation}
+\subsection{Protocol}
+Evaluation addresses operational behavior rather than perception benchmark accuracy. We inspected four existing Stage-1 run manifests produced from distinct video files. The integrated case study used a 10-s, 1280$\times$720, 24-fps near-nadir intersection clip and maximum-accuracy inference on an NVIDIA GeForce RTX 3050 Ti Laptop GPU (4 GB). No survey was available, so the image width was set to 40 m and all world distances retain assumed-scale status. Processing from Stage 1 through the Stage-4A proposal took 1039.8 s (17.3 min); interactive semantic review is excluded. We also ran the repository's complete Python test suite: 69 tests spanning the orchestrators and all four stages completed in 8.209 s with no failures.
+
+\subsection{Stage-1 Acceptance Boundary}
+Table~\ref{tab:clips} answers RQ1. All conforming runs exceeded 95\% sampled-frame registration and 99.7\% supported coverage. The longer crossroads run contains 1429 frames yet retained small consecutive center motion, while the perfect-top-down case tolerated a smooth 16.31\% cumulative scale change because the maximum single-frame scale step was only 0.2205\%. This supports separating scale from translation instead of rejecting all corner motion.
+
+The adverse clip failed four independent predicates: center step, registration, coverage, and unresolved foreground holes. It was not imported even though the source was readable and a provisional image could have been formed. This is the intended behavior of Eq.~\eqref{eq:gate}. The table does not establish a false-accept rate because the sample is small and lacks independent conformance annotation.
+
+\begin{table*}[t]
+\caption{Stage-1 Outcomes from Four Distinct Video Runs}
+\label{tab:clips}
+\centering
+\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lrrrrrrl@{}}
+\toprule
+Video run & Frames & Registered (\%) & Coverage (\%) & Max. center step (\%) & Median residual (px) & Unresolved holes (\%) & Decision \\
+\midrule
+Perfect top-down, 10 s & 240  & 95.122 & 100.000 & 0.103 & 1.0596 & 0.0000 & Pass \\
+Crossroads, 59.6 s     & 1429 & 100.000 & 99.711 & 0.008 & 0.7760 & 0.0000 & Pass \\
+Crossroads, 6.0 s      & 144  & 100.000 & 100.000 & 0.001 & 0.1025 & 0.0000 & Pass \\
+Adverse motion/occlusion, 10 s & 240 & 7.317 & 70.613 & 1.031 & 0.9783 & 21.3072 & Reject \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\subsection{Integrated Case Study}
+For the accepted case, 39 of 41 sampled frames registered and the reconstructed ground had complete supported coverage. Median registration residual was 1.0596 pixels. Median sharpness retention after normalization was 95.812\%; the minimum was 50.27\%, exposing that a small number of zoom-corrected samples were substantially softened. Foreground occupied 12.993\% of eligible temporal observations, while only 0.702\% of the final plate required conventional repair and none required learned inpainting. These values make the provenance of the visible ground inspectable.
+
+Stage 3 produced 3184 detections, of which 3170 (99.56\%) were assigned during association. After confirmation and filtering, 41 car and 22 person trajectories remained, with 2972 confirmed observations and 33 marked interpolations. The assignment ratio is an internal accounting measure, not identity accuracy: without annotated identities it cannot be interpreted as MOTA, HOTA, precision, or recall. Likewise, the maximum reported car speed of 9.50 assumed units/s inherits the operator's 40-m width and is not a surveyed speed.
+
+The operator-corrected Stage-4 map labeled 99.953\% of valid pixels, comprising 45.677\% road, 53.331\% pavement, and small vegetation/terrain fractions. It generated six surface regions and zero buildings (Fig.~\ref{fig:outputs}), consistent with the accepted road-only crop. This negative result is important: the geometry stage did not invent extrusions. Table~\ref{tab:case} summarizes the end-to-end evidence.
+
+\begin{table}[t]
+\caption{Integrated Case-Study Diagnostics}
+\label{tab:case}
+\centering
+\footnotesize
+\begin{tabular}{@{}lr@{}}
+\toprule
+Diagnostic & Recorded result \\
+\midrule
+Registered Stage-1 samples & 39/41 (95.12\%) \\
+Ground support / repaired area & 100.00\% / 0.702\% \\
+Median residual / sharpness retained & 1.0596 px / 95.812\% \\
+Detections / association assignments & 3184 / 3170 \\
+Confirmed car / person tracks & 41 / 22 \\
+Confirmed / interpolated observations & 2972 / 33 \\
+Known reviewed semantic area & 99.953\% \\
+Surface regions / buildings & 6 / 0 \\
+Pipeline runtime through Stage 4A & 1039.8 s \\
+Automated tests & 69/69 passed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Verification of Failure Semantics}
+The automated suite exercises more than successful execution. Tests cover cuts and timestamp handling, zoom continuity, registration and hole gates, duplicate control coordinates, degenerate homographies, assumed-scale metadata, temporal bounds, empty-actor imports, stale upstream hashes, model checksum enforcement, semantic correction validation, missing operator acceptance, geometry boundary cases, atomic replacement, and the rule that failed runs do not touch Unity assets. Passing these tests supports implementation consistency for the tested cases and directly addresses RQ3. It does not validate computer-vision accuracy or prove absence of defects outside the test space.
+
+\section{Discussion and Threats to Validity}
+\textbf{Construct validity:} coverage, residual, assignment, and known-label area measure internal contracts. They are not substitutes for geometric error, detection average precision, identity metrics, or semantic intersection over union. The paper reports them as diagnostics and avoids converting a zero-residual four-corner fit into an accuracy claim.
+
+\textbf{Internal validity:} the complete run is traceable through source, model, and artifact digests, and the same transform chain feeds all consumers. Nevertheless, semantic labels were operator corrected, thresholds were engineered for the available footage, and no ablation study isolates each heuristic. The four Stage-1 runs should be interpreted as boundary examples, not a statistical comparison.
+
+\textbf{External validity:} the input contract excludes oblique cameras, purposeful flight, strong parallax, multiple cuts, nonplanar terrain, and long-term occlusion. Performance may change with altitude, lens distortion, weather, geography, compression, or detector domain shift. The system cannot reconstruct facades hidden from a nadir camera. Oblique stationary video would first require a separately validated ground-plane rectification stage; moving multi-view footage calls for a different reconstruction model.
+
+\textbf{Measurement and ethical validity:} assumed horizontal scale propagates to actor dimensions and speeds, while height policies remain user assumptions. Metric use requires surveyed controls and independent height observations such as LiDAR, stereo, or genuine multi-view imagery. Videos containing identifiable people require lawful acquisition, data minimization, access control, and retention appropriate to the deployment context.
+
+\section{Conclusion}
+The presented pipeline converts a narrow but useful class of stationary nadir video into a reproducible planar Unity world. Its central result is architectural: registration, background recovery, calibration, actor playback, semantic review, and geometry share explicit coordinate, time, and provenance contracts. Three conforming videos passed the static-ground gate, an adverse video was rejected before import, the end-to-end case produced 63 confirmed actor tracks and a review-bound semantic scene, and all 69 automated tests passed. These observations answer the research questions at the level supported by current evidence: controlled acceptance, consistent replay, and explicit uncertainty. A broader claim will require surveyed multi-site data, annotated tracking and segmentation benchmarks, ablations, and independent depth or height sensing. The fail-closed design provides a defensible base for those extensions without presenting visual plausibility as measured reality.
+
+\section*{Acknowledgment}
+The authors thank Dr. Savitha Choudhary for mentoring and guiding this project. OpenAI Codex (GPT-5) assisted with drafting and language revision across all sections and with producing the original architecture diagram from the authors' implementation notes. All measurements were obtained from repository artifacts; the authors verified the technical claims, citations, and final manuscript and accept responsibility for its content.
+
+\IEEEtriggeratref{3}
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
 \end{document}
