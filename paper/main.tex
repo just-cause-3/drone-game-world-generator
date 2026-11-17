@@ -101,4 +101,58 @@ For the static scene, Mask2Former offers a common masked-attention formulation f
 \label{fig:architecture}
 \end{figure*}
 
+\section{System Model and Fail-Closed Design}
+\subsection{Input and Coordinate Contract}
+Let $I_n$ be constant-frame-rate (CFR) frame $n$, $p_n=[u,v,1]^T$ a homogeneous image point, and $r$ the temporal-center reference frame. Registration estimates the restricted similarity
+\begin{equation}
+S_n=\begin{bmatrix}
+s_n\cos\theta_n&-s_n\sin\theta_n&t_{x,n}\\
+s_n\sin\theta_n&s_n\cos\theta_n&t_{y,n}\\0&0&1
+\end{bmatrix},
+\end{equation}
+which maps frame $n$ into reference pixels. A projective transform $H$ then maps that plane into Unity's horizontal axes:
+\begin{equation}
+(x,z,1)^T \sim H S_n p_n,\quad
+\mathbf{x}_{U}(n)=(x,0,z),\quad t_n=n/f_{\mathrm{CFR}}.
+\label{eq:chain}
+\end{equation}
+The same chain is used for ground support, actor locations, semantic contours, and scene dimensions. Equation~\eqref{eq:chain} prevents a common implementation inconsistency in which tracking is performed in moving image coordinates while the texture is stabilized separately.
+
+The contract excludes cuts, strong perspective, purposeful camera translation, severe parallax, and persistent foreground coverage. Nadir orientation is operator asserted because image registration alone cannot prove it. Variable-rate input is normalized to CFR; timestamps, source hash, dimensions, and reference index are recorded so Unity can reproduce the exact timeline.
+
+\subsection{Stage Gates and Provenance}
+Each stage emits a JSON report with a schema identifier, options, assumptions, limitations, diagnostics, source hashes, and artifact hashes. For stage $k$, let $Q_k$ be its set of Boolean quality predicates and $D_k$ its declared upstream digests. Import authorization is
+\begin{equation}
+A_k=\left(\bigwedge_{q\in Q_k}q\right)\land
+    \left(\bigwedge_{d\in D_k}\mathrm{SHA256}(d.\mathrm{file})=d.\mathrm{hash}\right).
+\label{eq:gate}
+\end{equation}
+Temporary output is atomically promoted only when $A_k$ is true. Stage 4 geometry adds an operator-signed application record whose semantic-label and report hashes must still match. The Unity importers independently recheck schema, dimensions, source identity, chronology, and digests. Thus partial output, an edited label map, or a calibration copied from another run fails before scene replacement (Fig.~\ref{fig:architecture}).
+
+\section{Pipeline Method}
+\subsection{Stage 1: Validated Static Ground}
+The system first checks timestamps and cuts, then estimates geometric change for every consecutive pair. Forty-one uniform samples are matched to the reference with ORB~\cite{rublee2011orb}; a partial affine model is fitted by RANSAC~\cite{fischler1981ransac}. Gates bound the fraction of estimable pairs, consecutive scale/center/rotation steps, total corner and center motion, rotation, overlap, inlier count, reprojection residual, registered-sample ratio, coverage, and blur. Smooth zoom is allowed because $s_n$ is evaluated separately from $t_{x,n},t_{y,n}$. Every accepted image is resampled to the reference scale using Lanczos interpolation, and retained sharpness is reported.
+
+Foreground masks are obtained from the aerial detector using full-frame inference, 640-pixel overlapping tiles, test-time augmentation, global duplicate suppression, padding, and dilation. The static plate at pixel $p$ is the channelwise median of registered, valid, non-foreground observations; a minimum support count is enforced. Small gaps use Telea repair, while larger eligible components may use the LaMa inpainting model~\cite{suvorov2022lama}. Observed support, conventionally repaired area, learned repair, and unresolved area remain distinct. A residual detector pass must find no configured car/person class and unresolved holes must remain below threshold. Synthetic completion is therefore measurable and bounded rather than hidden.
+
+\subsection{Stage 2: Horizontal Coordinates}
+With surveyed ground-control points, $H$ is fitted from at least four image/world correspondences and checked for control-point uniqueness, hull coverage, reprojection error, handedness, finite projective behavior, and local anisotropy~\cite{hartley2004multiple}. Without measurements, the user supplies an approximate image width; the corners are mapped to a rectangle preserving aspect ratio. This mode is labeled \emph{approximate assumed scale}. Four corner correspondences exactly determine the planar map, so its zero algebraic residual has no independent degrees of freedom and is not described as real-world calibration accuracy.
+
+\subsection{Stage 3: Actor Reconstruction}
+The detector processes every CFR frame and retains only car, pedestrian, and people categories. Each box center and extent are transformed by $S_n$ before association. Track cost combines class compatibility, constant-velocity prediction, transformed-box intersection over union, size, and HSV appearance. High-score observations can initialize a track; lower-score observations can recover an existing track, following the association insight of ByteTrack~\cite{zhang2022bytetrack}. Confirmation requires five observations. Gaps of at most three frames may be interpolated and are explicitly flagged; longer gaps terminate visibility. A constant-velocity Rauch--Tung--Striebel smoother reduces jitter without changing sample times. Unity interpolates position and heading at $t_n$ and disables the actor outside its recorded visibility intervals.
+
+Model-space placement is intentionally conservative. Box dimensions are converted through the local scale of $H$ and clamped by class-specific plausibility limits. They are visualization dimensions when Stage 2 used assumed scale, not recovered physical measurements. Tracks outside the calibrated support, short unconfirmed tracks, and stationary false person tracks are discarded and counted.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/pipeline_outputs.png}
+  \caption{End-to-end artifacts (left to right): reconstructed static ground, stabilized car (blue) and person (yellow) trajectories, and operator-reviewed semantic labels. The accepted road-only map correctly yielded surfaces but no building geometry.}
+  \label{fig:outputs}
+\end{figure*}
+
+\subsection{Stage 4: Semantics to Provisional Geometry}
+Stage 4A runs Mask2Former~\cite{cheng2022mask2former} in the aerial OpenEarthMap domain~\cite{xia2023openearthmap}. A separate road specialist may promote road pixels but cannot overwrite protected classes. The canonical raster contains unknown, road, pavement, building, vegetation, terrain, water, and other-static labels. Dimension, coverage, component, and digest checks establish structural validity, not semantic correctness. Unity therefore presents the full-resolution overlay for review or corrected-label import.
+
+After exact-map acceptance, Stage 4B/C converts connected regions into editable geometry. Surface classes remain on the textured collision plane. Building contours are simplified, mapped through $H$, triangulated, and extruded only with a visibly declared height policy; vegetation proxies are opt-in. This separation is essential because a stationary top-down video sees roofs but supplies neither facade evidence nor building height. Any later change to labels invalidates acceptance and blocks regeneration until reviewed again.
+
 \end{document}
